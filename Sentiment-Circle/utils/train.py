@@ -301,8 +301,8 @@ def main():
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
-        file_name='logs/train.log',
-        file_mode='a',
+        filename="logs/train.log",
+        filemode="a",
     )
     training_args.log_level = "info"
     log_level = training_args.get_process_log_level()
@@ -340,7 +340,21 @@ def main():
     random.seed(seed)
     
     # ファイル種別確認
-    file_type = "csv" if data_args.train_file[0].endswith(".csv") else "json"
+    example_file = None
+    for file_list in (
+        data_args.train_file,
+        data_args.validation_file,
+        data_args.test_file,
+    ):
+        if file_list:
+            example_file = file_list[0]
+            break
+    if example_file is None:
+        raise ValueError(
+            "At least one of `train_file`, `validation_file`, or `test_file` must be provided."
+        )
+
+    file_type = "csv" if example_file.endswith(".csv") else "json"
 
     # ロード対象ファイルをログ出力
     if training_args.do_train:
@@ -366,11 +380,18 @@ def main():
 
     raw_datasets = {}
 
-    max_train_samples = data_args.max_train_samples
     for split in ["train", "validation", "test"]:
         paths = data_files.get(split, [])
         if not paths:
             continue
+
+        # Determine sampling limit per split
+        if split == "train":
+            sample_limit = data_args.max_train_samples
+        elif split == "validation":
+            sample_limit = data_args.max_eval_samples
+        else:
+            sample_limit = data_args.max_predict_samples
 
         # 1) 最初のファイルをロードしてベースの Dataset とする
         first = load_dataset(
@@ -379,13 +400,9 @@ def main():
             split=split,
             cache_dir=model_args.cache_dir,
         )
-        
-        # data が 5000 件を超えていたら制限
-        if len(first) > max_train_samples:
-            # ランダムサンプリングしたい場合
-            first = first.shuffle(seed=seed).select(range(max_train_samples))
-            # 先頭 5000 件だけでよければ
-            # first = first.select(range(max_train_samples))
+
+        if sample_limit is not None and len(first) > sample_limit:
+            first = first.shuffle(seed=seed).select(range(sample_limit))
 
         ds_list = [first]
 
@@ -397,12 +414,9 @@ def main():
                 split=split,
                 cache_dir=model_args.cache_dir,
             )
-            if len(ds) > max_train_samples:
-                # ランダムサンプリングしたい場合
-                ds = ds.shuffle(seed=seed).select(range(max_train_samples))
-                # 先頭 5000 件だけでよければ
-                # ds = ds.select(range(max_train_samples))
-            
+            if sample_limit is not None and len(ds) > sample_limit:
+                ds = ds.shuffle(seed=seed).select(range(sample_limit))
+
             ds_list.append(ds)
 
         # 3) まとめて連結
@@ -414,16 +428,25 @@ def main():
     for split in raw_datasets.keys():
         raw_datasets[split] = raw_datasets[split].shuffle(seed=seed)
     
-    labels = []
-    for key in raw_datasets["validation"].features.keys():
-        labels.append(key)
-    labels.remove("sentence1")
-    labels.remove("sentence2")
-    if "sentence3" in labels:
-        labels.remove("sentence3")
-        sentence3_flag = True
-    else:
-        sentence3_flag = False
+    # Ensure text column exists under sentence1
+    for split, dataset in raw_datasets.items():
+        column_names = dataset.column_names
+        if "sentence1" not in column_names:
+            # Try to find a reasonable default text column
+            text_column = None
+            for candidate in ["text", "sentence", "document", "utterance"]:
+                if candidate in column_names:
+                    text_column = candidate
+                    break
+            if text_column is None:
+                raise ValueError(
+                    "Dataset must include a text column named 'sentence1' or one of "
+                    "['text', 'sentence', 'document', 'utterance']."
+                )
+            dataset = dataset.rename_column(text_column, "sentence1")
+        raw_datasets[split] = dataset
+
+    sentence3_flag = any("sentence3" in dataset.column_names for dataset in raw_datasets.values())
     # if data_args.min_similarity is None:
     #     data_args.min_similarity = min(labels)
     #     logger.warning(
@@ -486,18 +509,80 @@ def main():
     else:
         classifier_configs = None
         aspect_key = model_args.aspect_key
+
+    if aspect_key is None:
+        aspect_key = []
+    elif isinstance(aspect_key, str):
+        aspect_key = [aspect_key]
+    else:
+        aspect_key = list(aspect_key)
+
+    label_candidates = ["labels", "label", "target"]
+    for split, dataset in raw_datasets.items():
+        for head in aspect_key:
+            if head in dataset.column_names:
+                continue
+            renamed = False
+            for candidate in label_candidates:
+                if candidate in dataset.column_names:
+                    dataset = dataset.rename_column(candidate, head)
+                    renamed = True
+                    break
+            if not renamed:
+                raise ValueError(
+                    f"Expected label column for head '{head}' not found in dataset columns: {dataset.column_names}"
+                )
+        raw_datasets[split] = dataset
+
+    for head in aspect_key:
+        sample_values = []
+        for dataset in raw_datasets.values():
+            if head in dataset.column_names:
+                values = [v for v in dataset[head] if v is not None]
+                if values:
+                    sample_values.extend(values)
+                    break
+        if not sample_values:
+            continue
+        if isinstance(sample_values[0], str):
+            unique_values = sorted({v for ds in raw_datasets.values() if head in ds.column_names for v in ds[head]})
+            label_to_id_map = {label: idx for idx, label in enumerate(unique_values)}
+
+            def _encode_labels(example):
+                value = example.get(head)
+                if value is not None and value in label_to_id_map:
+                    example[head] = label_to_id_map[value]
+                return example
+
+            raw_datasets = raw_datasets.map(
+                _encode_labels,
+                desc=f"Encoding labels for {head}",
+                load_from_cache_file=not data_args.overwrite_cache,
+            )
+
     if model_args.corr_labels is not None:
         if os.path.exists(model_args.corr_labels):
             corr_labels = json.load(open(model_args.corr_labels))
         else:
-            corr_labels = parse_dict(model_args.corr_labels) 
+            corr_labels = parse_dict(model_args.corr_labels)
+    else:
+        corr_labels = {}
     if model_args.corr_weights is not None:
         if os.path.exists(model_args.corr_weights):
             corr_weights = json.load(open(model_args.corr_weights))
         else:
             corr_weights = parse_dict(model_args.corr_weights)
+    else:
+        corr_weights = {}
 
-    id2_head = {i: head for i, head in enumerate(classifier_configs.keys())}
+    classifier_configs_for_trainer = (
+        classifier_configs
+        if classifier_configs is not None
+        else {head: {"objective": model_args.objective} for head in aspect_key}
+    )
+
+    labels = list(classifier_configs_for_trainer.keys())
+    id2_head = {i: head for i, head in enumerate(labels)}
     model = model_cls(model_config=config, classifier_configs=classifier_configs)
     if model_args.freeze_encoder:
         for param in model.backbone.parameters():
@@ -565,6 +650,16 @@ def main():
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = raw_datasets["train"]
+        train_dataset_size = len(train_dataset)
+        max_train_samples = (
+            data_args.max_train_samples
+            if data_args.max_train_samples is not None
+            else train_dataset_size
+        )
+    else:
+        train_dataset = None
+        train_dataset_size = 0
+        max_train_samples = data_args.max_train_samples or 0
     if training_args.do_eval:
         if (
             "validation" not in raw_datasets
@@ -577,17 +672,21 @@ def main():
             raise ValueError("--do_predict requires a test dataset")
         predict_dataset = raw_datasets["test"]
     # Log a few random samples from the training set:
-    if training_args.do_train:
-        for index in random.sample(range(len(train_dataset)), 3):
+    if training_args.do_train and train_dataset is not None:
+        sample_count = min(3, train_dataset_size)
+        indices = random.sample(range(train_dataset_size), sample_count) if sample_count > 0 else []
+        for index in indices:
             input_ids = train_dataset[index]["input_ids"]
             logger.info(f"tokens: {tokenizer.decode(input_ids)}")
             logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+
+    collator_dtype = getattr(config, "torch_dtype", None) or torch.float32
 
     data_collator = DataCollatorForBiEncoder(
         tokenizer=tokenizer,
         padding="max_length",
         pad_to_multiple_of=None,
-        dtype=config.torch_dtype
+        dtype=collator_dtype,
     )
     
     # try:
@@ -613,23 +712,24 @@ def main():
         
     compute_fn = partial(
         compute_metrics,
-        classifier_configs=classifier_configs if classifier_configs is not None else {"objective": model_args.objective},
+        classifier_configs=classifier_configs_for_trainer,
         id2_head=id2_head,
     )
     
     trainer = CustomTrainer(
         model=model,
         args=training_args,
-        classifier_configs=classifier_configs if classifier_configs is not None else {"objective": model_args.objective},
+        classifier_configs=classifier_configs_for_trainer,
         data_collator=data_collator,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         compute_metrics=compute_fn,
         tokenizer=tokenizer,
         callbacks=[LogCallback],
-        dtype=config.torch_dtype,
+        dtype=collator_dtype,
         corr_labels=corr_labels,
         corr_weights=corr_weights,
+        tsne_save_dir=os.path.join(training_args.output_dir, "tsne_plots"),
     )
     
     trainer.remove_callback(PrinterCallback)

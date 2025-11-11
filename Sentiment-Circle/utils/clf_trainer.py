@@ -1,15 +1,24 @@
+import os
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import Trainer
-from torch import Tensor
-import numpy as np
-from typing import List, Dict, Any, Optional
-from collections import defaultdict
+from datasets import Dataset
+from lightgbm import LGBMClassifier
+from sklearn.manifold import TSNE
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC
-from lightgbm import LGBMClassifier
+from torch import Tensor
+from transformers import Trainer
+
+from typing import List, Dict, Any, Optional
+from collections import defaultdict
 from .sentence_batch_utils import (
     BatchPartitioner,
     extract_unique_strings,
@@ -52,6 +61,9 @@ class CustomTrainer(Trainer):
         *args,
         classifier_configs,
         dtype=torch.float16,
+        tsne_save_dir: Optional[str] = None,
+        corr_labels: Optional[Dict[str, Dict[str, float]]] = None,
+        corr_weights: Optional[Dict[str, Dict[str, float]]] = None,
         **kwargs
     ):
         """
@@ -60,6 +72,10 @@ class CustomTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.classifier_configs = classifier_configs
         self.dtype = dtype
+        self.tsne_save_dir = tsne_save_dir
+        self._tsne_current_dataset = None
+        self._last_eval_predictions: Optional[Any] = None
+        self._last_eval_label_ids: Optional[Any] = None
 
         # 損失関数リストを準備
         self.loss_fns = {}
@@ -97,7 +113,19 @@ class CustomTrainer(Trainer):
                 self.head_objectives[name] = ContrastiveLogitObjective(name, cfg)
 
         self.corr_labels = defaultdict(dict)
+        if corr_labels:
+            for head_i, mapping in corr_labels.items():
+                if mapping:
+                    self.corr_labels[head_i].update(mapping)
+
         self.corr_weights = defaultdict(dict)
+        if corr_weights:
+            for head_i, mapping in corr_weights.items():
+                if mapping:
+                    self.corr_weights[head_i].update(mapping)
+
+        if self.tsne_save_dir is not None:
+            os.makedirs(self.tsne_save_dir, exist_ok=True)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
@@ -110,7 +138,8 @@ class CustomTrainer(Trainer):
         F) 3文サブバッチ全体で相関ペナルティ
         """
         device = next(model.parameters()).device
-        torch.cuda.reset_peak_memory_stats(device)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         partitioner = BatchPartitioner(
             attention_mask=inputs["attention_mask"],
             attention_mask_2=inputs.get("attention_mask_2"),
@@ -405,6 +434,139 @@ class CustomTrainer(Trainer):
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         return self.evaluation_step(model, inputs, prediction_loss_only, ignore_keys)
+
+    def evaluate(
+        self,
+        eval_dataset: Optional[Dataset] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ):
+        """オリジナルの evaluate を拡張し、評価前後で T-SNE プロットを生成する。"""
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        previous_dataset = self._tsne_current_dataset
+        self._tsne_current_dataset = dataset
+        try:
+            return super().evaluate(
+                eval_dataset=eval_dataset,
+                ignore_keys=ignore_keys,
+                metric_key_prefix=metric_key_prefix,
+            )
+        finally:
+            self._tsne_current_dataset = previous_dataset
+
+    def evaluation_loop(
+        self,
+        dataloader,
+        description: str,
+        prediction_loss_only: Optional[bool] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ):
+        output = super().evaluation_loop(
+            dataloader,
+            description,
+            prediction_loss_only=prediction_loss_only,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+
+        self._last_eval_predictions = output.predictions
+        self._last_eval_label_ids = output.label_ids
+
+        if (
+            self.tsne_save_dir
+            and self._tsne_current_dataset is not None
+            and self._tsne_current_dataset is self.eval_dataset
+            and metric_key_prefix.startswith("eval")
+        ):
+            self._save_tsne_plot(metric_key_prefix)
+
+        return output
+
+    def _to_numpy(self, value: Any) -> Optional[np.ndarray]:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().numpy()
+        try:
+            return np.asarray(value)
+        except Exception:
+            return None
+
+    def _extract_labels(self, label_ids: Any, target_len: int) -> np.ndarray:
+        labels = None
+        if isinstance(label_ids, dict):
+            labels = label_ids.get("labels")
+        else:
+            labels = label_ids
+
+        arr = self._to_numpy(labels)
+        if arr is None or arr.size == 0:
+            return np.arange(target_len)
+
+        flat = arr.reshape(-1)
+        if flat.shape[0] < target_len:
+            pad = np.full(target_len - flat.shape[0], -1)
+            flat = np.concatenate([flat, pad])
+        elif flat.shape[0] > target_len:
+            flat = flat[:target_len]
+        return flat
+
+    def _save_tsne_plot(self, metric_key_prefix: str) -> None:
+        if not isinstance(self._last_eval_predictions, dict):
+            return
+        embeddings = self._last_eval_predictions.get("embeddings")
+        if embeddings is None:
+            return
+
+        emb_array = self._to_numpy(embeddings)
+        if emb_array is None or emb_array.ndim != 2 or emb_array.shape[0] < 2:
+            return
+
+        labels = self._extract_labels(self._last_eval_label_ids, emb_array.shape[0])
+
+        perplexity = max(1, min(30, emb_array.shape[0] - 1))
+        if emb_array.shape[0] <= 2:
+            perplexity = 1
+
+        tsne = TSNE(
+            n_components=2,
+            perplexity=perplexity,
+            random_state=getattr(self.args, "seed", 42) or 42,
+            init="random",
+        )
+        points_2d = tsne.fit_transform(emb_array)
+
+        os.makedirs(self.tsne_save_dir, exist_ok=True)
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        unique_labels = np.unique(labels)
+        cmap = plt.cm.get_cmap("tab20", len(unique_labels) or 1)
+
+        for idx, label in enumerate(unique_labels):
+            mask = labels == label
+            ax.scatter(
+                points_2d[mask, 0],
+                points_2d[mask, 1],
+                s=15,
+                color=cmap(idx),
+                label=str(label),
+                alpha=0.8,
+                edgecolors="none",
+            )
+
+        ax.set_title("Evaluation Embeddings t-SNE")
+        ax.set_xlabel("Component 1")
+        ax.set_ylabel("Component 2")
+        ax.legend(loc="best", fontsize="small", title="Label")
+        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
+
+        step = self.state.global_step if self.state is not None else 0
+        filename = f"{metric_key_prefix}_tsne_step-{step:06d}.png"
+        save_path = os.path.join(self.tsne_save_dir, filename)
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=200)
+        plt.close(fig)
 
     def _head_mask(self, active_heads_field: Any, head: str, device: torch.device) -> Optional[torch.Tensor]:
         if active_heads_field is None:
