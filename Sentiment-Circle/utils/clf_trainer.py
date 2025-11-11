@@ -11,11 +11,17 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC
 from lightgbm import LGBMClassifier
 from .sentence_batch_utils import (
-    compute_sentence_partitions,
+    BatchPartitioner,
     extract_unique_strings,
     flatten_strings,
-    merge_indexed_outputs,
-    slice_input_batch,
+)
+from .head_objectives import (
+    AngleNCEObjective,
+    BinaryClassificationObjective,
+    ContrastiveLogitObjective,
+    HeadObjective,
+    InfoNCEObjective,
+    RegressionObjective,
 )
 
 def pearsonr_torch(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -76,6 +82,22 @@ class CustomTrainer(Trainer):
                     "neg_pairs": cfg.get("inbatch_negative_pairs", 64),
                 }
         self.head2idx = {head: i for i, head in enumerate(classifier_configs.keys())}
+        self.head_objectives: Dict[str, HeadObjective] = {}
+        for name, cfg in classifier_configs.items():
+            obj = cfg.get("objective")
+            if obj == "infoNCE":
+                self.head_objectives[name] = InfoNCEObjective(name, cfg)
+            elif obj == "angleNCE":
+                self.head_objectives[name] = AngleNCEObjective(name, cfg)
+            elif obj == "regression":
+                self.head_objectives[name] = RegressionObjective(name, cfg)
+            elif obj == "binary_classification":
+                self.head_objectives[name] = BinaryClassificationObjective(name, cfg)
+            elif obj == "contrastive_logit":
+                self.head_objectives[name] = ContrastiveLogitObjective(name, cfg)
+
+        self.corr_labels = defaultdict(dict)
+        self.corr_weights = defaultdict(dict)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
@@ -87,232 +109,148 @@ class CustomTrainer(Trainer):
         E) 3文サブバッチは contrastive_logit
         F) 3文サブバッチ全体で相関ペナルティ
         """
-        bsz     = inputs["input_ids"].size(0)
-        # print(f"inputs size: {inputs['input_ids'].size()}")
-        # device  = model.device
-        # device = inputs["input_ids"].device
         device = next(model.parameters()).device
         torch.cuda.reset_peak_memory_stats(device)
-        partitions = compute_sentence_partitions(
+        partitioner = BatchPartitioner(
             attention_mask=inputs["attention_mask"],
             attention_mask_2=inputs.get("attention_mask_2"),
             attention_mask_3=inputs.get("attention_mask_3"),
         )
-        idx1 = partitions["idx_single"]
-        idx2 = partitions["idx_pair"]
-        idx3 = partitions["idx_triplet"]
+        bsz = inputs["input_ids"].size(0)
 
-        inputs1 = slice_input_batch(inputs, idx1, device)
-        inputs2 = slice_input_batch(inputs, idx2, device)
-        inputs3 = slice_input_batch(inputs, idx3, device)
+        inputs1 = partitioner.slice(inputs, "single", device)
+        inputs2 = partitioner.slice(inputs, "pair", device)
+        inputs3 = partitioner.slice(inputs, "triplet", device)
 
-        # サブバッチの教師損失（active_heads ごと）
-        # print(f"active_heads: {inputs['active_heads']}")
         active_heads = extract_unique_strings(inputs["active_heads"])
-        labels1 = inputs1.get("labels", {})
-        labels2 = inputs2.get("labels", {})
-        labels3 = inputs3.get("labels", {})
+        labels1 = inputs1.get("labels") if inputs1 else None
+        labels2 = inputs2.get("labels") if inputs2 else None
+        labels3 = inputs3.get("labels") if inputs3 else None
 
         total_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
-        # print(f"idx2: {idx2}, idx3: {idx3}, bsz: {bsz}")
-
-        # print(f"[Before outputs2] alloc={mem_alloc:.2f} GB, reserved={mem_reserved:.2f} GB, peak={mem_peak:.2f} GB")
-
-        # B) 1文サブバッチの encode() → embedding から損失ペアを構成して計算
-        outputs1 = {}
-        if idx1.numel() > 0:
+        outputs1: Dict[str, torch.Tensor] = {}
+        if inputs1:
             outputs1 = model(**inputs1)
-            embeddings1 = outputs1["embeddings"]  # (bsz1, dim)
+            embeddings1 = outputs1.get("embeddings")
+            if embeddings1 is None:
+                raise ValueError("Model did not return 'embeddings' for single-sentence inputs.")
             for head in active_heads:
-                head_idx = [True if h == head else False for h in flatten_strings(inputs1["active_heads"])]
-                if head_idx.count(True) == 0:
+                objective = self.head_objectives.get(head)
+                if objective is None:
                     continue
-                sub_emb = embeddings1[head_idx]  # (sub_bsz, dim)
-                sub_tgt = labels1[head_idx].flatten()  # (sub_bsz,)
-                
-                """
-                id2label = {0: "negative", 1: "neutral", 2: "positive"...} - 感情ラベルとidの対応
-                angle_map = {"negative": 180.0, "neutral": 90.0, "positive": 0.0} - 感情ラベルと角度の対応
-                sub_emb: (sub_bsz, dim) - 埋め込みベクトル
-                sub_tgt: (sub_bsz,) - 文章の感情ラベルのid
-                """
-                
-                # print(f"Processing head: {head}, embedding: {sub_emb}, target: {sub_tgt}")
-                assert sub_emb.size(0) == sub_tgt.size(0), "Embeddings and targets must have the same batch size."
-                mask    = ~torch.isnan(sub_tgt)
-                if mask.sum() > 0:
-                    sub_emb = sub_emb[mask]
-                    sub_tgt = sub_tgt[mask]
-                    if sub_emb.size(0) < 2:
-                        continue
-                    if self.classifier_configs[head]["objective"] == "infoNCE":
-                        params = self.info_nce_params.get(head, {})
-                        tau = float(params.get("tau", 1.0))
-                        pos_pairs = int(params.get("pos_pairs", 0))
-                        neg_pairs = int(params.get("neg_pairs", 0))
-                        if tau <= 0:
-                            tau = 1.0
-                        info_nce_loss = self._compute_info_nce_loss(
-                            embeddings=sub_emb,
-                            labels=sub_tgt.long(),
-                            tau=tau,
-                            max_pos_pairs=max(pos_pairs, 0),
-                            max_neg_pairs=max(neg_pairs, 0),
-                        )
-                        if info_nce_loss is not None:
-                            total_loss = total_loss + info_nce_loss
-                    
-                    elif self.classifier_configs[head]["objective"] == "angleNCE":
-                        pass
+                mask = self._head_mask(inputs1.get("active_heads"), head, device)
+                if mask is None or mask.sum() == 0:
+                    continue
+                if labels1 is None:
+                    continue
+                sub_emb = embeddings1[mask]
+                sub_tgt = labels1[mask].flatten()
+                valid = self._finite_mask(sub_tgt)
+                if valid.sum() == 0:
+                    continue
+                sub_emb = sub_emb[valid]
+                sub_tgt = sub_tgt[valid]
+                if sub_emb.size(0) < 2:
+                    continue
+                loss = objective.compute_single(self, sub_emb, sub_tgt)
+                if loss is not None:
+                    total_loss = total_loss + loss
 
-
-        # C) 2文サブバッチの教師損失（active_heads ごと）
-        outputs2 = {}
-        if idx2.numel() > 0:
+        outputs2: Dict[str, torch.Tensor] = {}
+        if inputs2:
             outputs2 = model(**inputs2)
-            # print(f"outputs2 keys: {outputs2.keys()}")
-        
-            # print(f"[After outputs2] alloc={mem_alloc:.2f} GB, reserved={mem_reserved:.2f} GB, peak={mem_peak:.2f} GB")
-
             for head in active_heads:
-                head_idx = [True if h == head else False for h in flatten_strings(inputs2["active_heads"])]
-                if head_idx.count(True) == 0:
+                objective = self.head_objectives.get(head)
+                if objective is None:
                     continue
-                sub_out = outputs2.get(head)[head_idx]
-                sub_tgt = labels2[head_idx].flatten()
-                # print(f"input2: {inputs2}")
-                # print(f"Processing head: {head}, output: {sub_out}, target: {sub_tgt}")
-                assert sub_out.size(0) == sub_tgt.size(0), "Outputs and targets must have the same batch size."
-                mask    = ~torch.isnan(sub_tgt)
-                if mask.sum() > 0:
-                    total_loss = total_loss + self.loss_fns[head](
-                        sub_out[mask].to(torch.float32),
-                        sub_tgt[mask].to(torch.float32),
-                    )
+                tensor = outputs2.get(head)
+                if tensor is None:
+                    continue
+                mask = self._head_mask(inputs2.get("active_heads"), head, device)
+                if mask is None or mask.sum() == 0:
+                    continue
+                if labels2 is None:
+                    continue
+                sub_out = tensor[mask]
+                sub_tgt = labels2[mask].flatten()
+                valid = self._finite_mask(sub_tgt)
+                if valid.sum() == 0:
+                    continue
+                sub_out = sub_out[valid]
+                sub_tgt = sub_tgt[valid]
+                loss = objective.compute_pair(sub_out, sub_tgt)
+                if loss is not None:
+                    total_loss = total_loss + loss
 
-            # D) 2文サブバッチ全体での相関ペナルティ
             for hi, row in self.corr_labels.items():
                 for hj, target_corr in row.items():
-                    # 両方とも 2文教師損失対象ではなくても、ここは常に計算
                     if hi not in outputs2 or hj not in outputs2:
                         continue
                     oi = outputs2[hi]
                     oj = outputs2[hj]
-                    # pearson 相関を使用
                     xi = oi.float()
                     xj = oj.float()
                     if xi.numel() > 1 and xj.numel() > 1:
-                        # 2×batch_size の行列を作って相関行列を計算
                         corrmat = torch.corrcoef(torch.stack([xi, xj], dim=0))
-                        rho     = corrmat[0, 1]
-                        # rho = pearsonr_torch(xi, xj)
-                        
-                        # spearman 相関の場合
-                        # ri = torch.argsort(torch.argsort(oi))
-                        # rj = torch.argsort(torch.argsort(oj))
-                        # corrmat = torch.corrcoef(torch.stack([ri.float(), rj.float()]))
-                        # rho     = corrmat[0,1]    
-
+                        rho = corrmat[0, 1]
                         weights = self.corr_weights.get(hi, {}).get(hj, 1.0)
-                        tgt     = torch.tensor(target_corr, device=device, dtype=rho.dtype)
-                        # print(f"Processing correlation: {hi} vs {hj}, {len(xi)}, {len(xj)}, corr: {rho.item()}, target: {tgt.item()}")
+                        tgt = torch.tensor(target_corr, device=device, dtype=rho.dtype)
                         total_loss = total_loss + weights * F.mse_loss(rho, tgt)
 
-        # E) 3文サブバッチの contrastive_logit 損失（active_heads ごと）
-        outputs3 = {}
-        if idx3.numel() > 0:
+        outputs3: Dict[str, torch.Tensor] = {}
+        if inputs3:
             outputs3 = model(**inputs3)
-            # print(f"outputs3 keys: {outputs3.keys()}")
-            
-            # print(f"[Before outputs3] alloc={mem_alloc:.2f} GB, reserved={mem_reserved:.2f} GB, peak={mem_peak:.2f} GB")
-
-            # (1) CE & triplet
             for head in active_heads:
-                head_idx = [True if h == head else False for h in flatten_strings(inputs3["active_heads"])]
-                if head_idx.count(True) == 0:
+                objective = self.head_objectives.get(head)
+                if objective is None:
                     continue
-                # anchor_prob の CE
-                prob_key = f"{head}_anchor_prob"
-                logits = outputs3[prob_key][head_idx].to(torch.float32)
-                tgt    = labels3[head_idx].to(device).long()
-                # print(f"Processing head: {head}, logits: {logits}, target: {tgt}")
-                assert logits.size(0) == tgt.size(0), "Logits and targets must have the same batch size."
-                total_loss = total_loss + self.gamma[head] * F.cross_entropy(logits, tgt)
-                # margin triplet
-                pos = outputs3[f"{head}_pos_similarity"][head_idx]
-                neg = outputs3[f"{head}_neg_similarity"][head_idx]
-                
-                if pos is not None and neg is not None:
-                    if self.classifier_configs[head].get("loss_type", "triplet") == "triplet":
-                        if self.margin[head] > 0:
-                            # close positive, far negative
-                            triplet = F.relu(neg - pos + self.margin[head]).mean()
-                        else:
-                            # close negative, far positive
-                            triplet = F.relu(pos - neg - self.margin[head]).mean()
-                        total_loss = total_loss + self.alpha[head] * triplet
+                mask = self._head_mask(inputs3.get("active_heads"), head, device)
+                if mask is None or mask.sum() == 0:
+                    continue
+                if labels3 is None:
+                    continue
+                subset_labels = labels3[mask].flatten()
+                valid = self._finite_mask(subset_labels)
+                if valid.sum() == 0:
+                    continue
+                refined_mask = mask.clone()
+                refined_mask[mask] = valid
+                loss = objective.compute_triplet(
+                    self,
+                    outputs3,
+                    refined_mask,
+                    subset_labels[valid],
+                )
+                if loss is not None:
+                    total_loss = total_loss + loss
 
-                    elif self.classifier_configs[head].get("loss_type", "triplet") == "infoNCE":
-                        # 1) 温度パラメータ τ の取得（config で指定すると良い）
-                        tau = self.classifier_configs[head].get("tau", 1.0)
-
-                        # 2) logits を作成
-                        # neg が 1D の場合は (batch,1) に reshape
-                        pos = pos.view(-1, 1)
-                        neg = neg.view(pos.size(0), -1)  # neg が (batch, N) のときはそのまま
-
-                        logits = torch.cat([pos, neg], dim=1)  # (batch, 1+N)
-                        logits = logits / tau
-
-                        # 3) positive が index 0 の教師ラベル
-                        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
-
-                        # 4) cross-entropy で -log p_pos を計算
-                        infoNCE_loss = F.cross_entropy(logits, labels)
-
-                        # 5) 必要なら重み α を乗じる
-                        total_loss = total_loss + self.alpha[head] * infoNCE_loss
-
-            # F) contrastive heads 間の相関ペナルティ
-            #    pos/neg を縦連結して順位 → Spearman 近似
             for hi, row in self.corr_labels.items():
                 for hj, tgt_corr in row.items():
-                    pos_i = outputs3[f"{hi}_pos_similarity"]
-                    neg_i = outputs3[f"{hi}_neg_similarity"]
-                    pos_j = outputs3[f"{hj}_pos_similarity"]
-                    neg_j = outputs3[f"{hj}_neg_similarity"]
-
+                    pos_i = outputs3.get(f"{hi}_pos_similarity")
+                    neg_i = outputs3.get(f"{hi}_neg_similarity")
+                    pos_j = outputs3.get(f"{hj}_pos_similarity")
+                    neg_j = outputs3.get(f"{hj}_neg_similarity")
+                    if pos_i is None or neg_i is None or pos_j is None or neg_j is None:
+                        continue
                     vi = torch.cat([pos_i, neg_i], dim=0)
                     vj = torch.cat([pos_j, neg_j], dim=0)
-
-                    # ---- Pearson 相関を計算 ----
                     xi = vi.float()
                     xj = vj.float()
                     if xi.numel() > 1 and xj.numel() > 1:
-                        # 2行 N 列 の行列にして相関行列を得る
                         corrmat = torch.corrcoef(torch.stack([xi, xj], dim=0))
-                        rho     = corrmat[0, 1]
-                        # rho = pearsonr_torch(xi, xj)
-
-                        # spearman 相関を使用
-                        # ri = torch.argsort(torch.argsort(vi))
-                        # rj = torch.argsort(torch.argsort(vj))
-                        # corrmat = torch.corrcoef(torch.stack([ri.float(), rj.float()]))
-                        # rho     = corrmat[0,1]
-                        
+                        rho = corrmat[0, 1]
                         weights = self.corr_weights.get(hi, {}).get(hj, 1.0)
-                        tgt     = torch.tensor(tgt_corr, device=device, dtype=rho.dtype)
-                        # print(f"Processing correlation: {hi} vs {hj}, {len(xi)}, {len(xj)}, corr: {rho.item()}, target: {tgt.item()}")
+                        tgt = torch.tensor(tgt_corr, device=device, dtype=rho.dtype)
                         total_loss = total_loss + weights * F.mse_loss(rho, tgt)
 
-        # 4) サブバッチ出力を全バッチサイズにマージ
-        full_outputs = merge_indexed_outputs(
-            bsz,
-            device,
-            (idx1, outputs1),
-            (idx2, outputs2),
-            (idx3, outputs3),
+        full_outputs = partitioner.merge(
+            {
+                "single": outputs1,
+                "pair": outputs2,
+                "triplet": outputs3,
+            },
+            device=device,
         )
         
         # 5) 欠けているキーをすべて埋める
@@ -355,12 +293,10 @@ class CustomTrainer(Trainer):
                 if key not in full_outputs:
                     full_outputs[key] = torch.full((bsz,), float("nan"), device=device)
         
-        print(f"total_loss: {total_loss.item()}, full_outputs keys: {full_outputs.keys()}")
-        
         if not return_outputs:
             return total_loss
-    
-        return total_loss, full_outputs 
+
+        return total_loss, full_outputs
 
 
     def _compute_info_nce_loss(
@@ -469,3 +405,28 @@ class CustomTrainer(Trainer):
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         return self.evaluation_step(model, inputs, prediction_loss_only, ignore_keys)
+
+    def _head_mask(self, active_heads_field: Any, head: str, device: torch.device) -> Optional[torch.Tensor]:
+        if active_heads_field is None:
+            return None
+        if isinstance(active_heads_field, torch.Tensor):
+            if active_heads_field.dtype == torch.bool:
+                return active_heads_field.to(device)
+            if active_heads_field.dtype in (torch.int32, torch.int64, torch.long):
+                idx = self.head2idx.get(head)
+                if idx is None:
+                    return None
+                return (active_heads_field.to(device) == idx)
+        heads = flatten_strings(active_heads_field)
+        if not heads:
+            return None
+        mask_list = [h == head for h in heads]
+        if not any(mask_list):
+            return None
+        return torch.tensor(mask_list, device=device, dtype=torch.bool)
+
+    @staticmethod
+    def _finite_mask(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.dtype.is_floating_point:
+            return torch.isfinite(tensor)
+        return torch.ones(tensor.shape, dtype=torch.bool, device=tensor.device)

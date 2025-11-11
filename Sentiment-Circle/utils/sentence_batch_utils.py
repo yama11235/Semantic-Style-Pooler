@@ -1,5 +1,5 @@
 import torch
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from transformers import PreTrainedTokenizerBase
 
 
@@ -38,6 +38,10 @@ def flatten_strings(
     return flattened
 
 
+# ---------------------------------------------------------------------------
+# Partition utilities
+# ---------------------------------------------------------------------------
+
 def compute_sentence_partitions(
     attention_mask: torch.Tensor,
     attention_mask_2: Optional[torch.Tensor] = None,
@@ -70,6 +74,85 @@ def compute_sentence_partitions(
         "idx_pair": torch.nonzero(has_second & ~has_third, as_tuple=True)[0],
         "idx_triplet": torch.nonzero(has_third, as_tuple=True)[0],
     }
+
+
+class BatchPartitioner:
+    """Utility object that centralises the 1/2/3 sentence partition logic."""
+
+    _KIND_TO_KEY = {
+        "single": "idx_single",
+        "pair": "idx_pair",
+        "triplet": "idx_triplet",
+    }
+
+    def __init__(
+        self,
+        attention_mask: torch.Tensor,
+        attention_mask_2: Optional[torch.Tensor] = None,
+        attention_mask_3: Optional[torch.Tensor] = None,
+    ) -> None:
+        self._partitions = compute_sentence_partitions(
+            attention_mask=attention_mask,
+            attention_mask_2=attention_mask_2,
+            attention_mask_3=attention_mask_3,
+        )
+        self._base_device = attention_mask.device
+        self._batch_size = attention_mask.size(0)
+
+    @property
+    def device(self) -> torch.device:
+        return self._base_device
+
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
+
+    def indices(self, kind: str) -> torch.Tensor:
+        if kind not in self._KIND_TO_KEY:
+            raise ValueError(f"Unknown partition kind: {kind}")
+        return self._partitions[self._KIND_TO_KEY[kind]]
+
+    def kinds(self) -> Iterable[str]:
+        return self._KIND_TO_KEY.keys()
+
+    def uniform_kind(self) -> Optional[str]:
+        if self._partitions["has_only_first"].all():
+            return "single"
+        if self._partitions["has_third"].all():
+            return "triplet"
+        if (~self._partitions["has_third"]).all() and self._partitions["has_second"].all():
+            return "pair"
+        return None
+
+    def has_kind(self, kind: str) -> bool:
+        return self.indices(kind).numel() > 0
+
+    def slice(
+        self,
+        batch: Dict[str, Any],
+        kind: str,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        indices = self.indices(kind)
+        if indices.numel() == 0:
+            return {}
+        return slice_input_batch(batch, indices, device)
+
+    def merge(
+        self,
+        outputs_by_kind: Dict[str, Dict[str, torch.Tensor]],
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, torch.Tensor]:
+        device = device or self.device
+        indexed_outputs: List[Tuple[torch.Tensor, Dict[str, torch.Tensor]]] = []
+        for kind, outputs in outputs_by_kind.items():
+            if not outputs:
+                continue
+            idx = self.indices(kind)
+            if idx.numel() == 0:
+                continue
+            indexed_outputs.append((idx, outputs))
+        return merge_indexed_outputs(self.batch_size, device, *indexed_outputs)
 
 
 def slice_input_batch(
@@ -170,6 +253,7 @@ def tokenize_optional_sentences(
 __all__ = [
     "extract_unique_strings",
     "flatten_strings",
+    "BatchPartitioner",
     "compute_sentence_partitions",
     "slice_input_batch",
     "merge_indexed_outputs",
