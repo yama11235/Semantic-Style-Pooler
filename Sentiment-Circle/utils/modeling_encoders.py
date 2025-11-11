@@ -19,7 +19,7 @@ from .modeling_config import (
 )
 import os
 from .modeling_classifier import LinearLayer, MLP2Layer, ContrastiveClassifier
-from .sentence_batch_utils import compute_sentence_partitions, merge_indexed_outputs
+from .sentence_batch_utils import BatchPartitioner
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s: %(message)s')
 
@@ -28,6 +28,108 @@ logger = logging.getLogger(__name__)
 
 def concat_features(*features):
     return torch.cat(features, dim=0) if features[0] is not None else None
+
+
+def _sentence_kwargs(batch: dict, suffix: str = "") -> dict:
+    keys = [
+        "input_ids",
+        "attention_mask",
+        "token_type_ids",
+        "position_ids",
+        "head_mask",
+        "inputs_embeds",
+    ]
+    payload = {}
+    for key in keys:
+        name = key if not suffix else f"{key}_{suffix}"
+        payload[key] = batch.get(name)
+    return payload
+
+
+class SentencePath:
+    kind = ""
+
+    def __init__(self, model: "BiEncoderForClassification") -> None:
+        self.model = model
+
+    def run_full(self, batch: dict, extra_kwargs: dict) -> dict:
+        return self._forward(batch, extra_kwargs)
+
+    def run_partition(
+        self,
+        batch: dict,
+        partitioner: BatchPartitioner,
+        device: torch.device,
+        extra_kwargs: dict,
+    ) -> dict:
+        subset = partitioner.slice(batch, self.kind, device=device)
+        if not subset:
+            return {}
+        return self._forward(subset, extra_kwargs)
+
+    def _forward(self, batch: dict, extra_kwargs: dict) -> dict:  # pragma: no cover - abstract helper
+        raise NotImplementedError
+
+
+class SingleSentencePath(SentencePath):
+    kind = "single"
+
+    def _forward(self, batch: dict, extra_kwargs: dict) -> dict:
+        args = _sentence_kwargs(batch)
+        return self.model.encode(**args)
+
+
+class PairSentencePath(SentencePath):
+    kind = "pair"
+
+    def _forward(self, batch: dict, extra_kwargs: dict) -> dict:
+        first = _sentence_kwargs(batch)
+        second = _sentence_kwargs(batch, "2")
+        return self.model._forward_binary(
+            first["input_ids"],
+            first["attention_mask"],
+            first["token_type_ids"],
+            first["position_ids"],
+            first["head_mask"],
+            first["inputs_embeds"],
+            second["input_ids"],
+            second["attention_mask"],
+            second["token_type_ids"],
+            second["position_ids"],
+            second["head_mask"],
+            second["inputs_embeds"],
+            **extra_kwargs,
+        )
+
+
+class TripletSentencePath(SentencePath):
+    kind = "triplet"
+
+    def _forward(self, batch: dict, extra_kwargs: dict) -> dict:
+        first = _sentence_kwargs(batch)
+        second = _sentence_kwargs(batch, "2")
+        third = _sentence_kwargs(batch, "3")
+        return self.model.triplet_encode(
+            first["input_ids"],
+            first["attention_mask"],
+            first["token_type_ids"],
+            first["position_ids"],
+            first["head_mask"],
+            first["inputs_embeds"],
+            second["input_ids"],
+            second["attention_mask"],
+            second["token_type_ids"],
+            second["position_ids"],
+            second["head_mask"],
+            second["inputs_embeds"],
+            third["input_ids"],
+            third["attention_mask"],
+            third["token_type_ids"],
+            third["position_ids"],
+            third["head_mask"],
+            third["inputs_embeds"],
+            **extra_kwargs,
+        )
 
 def calculate_similarity(name, output1, output2, classifier_configs):
     """
@@ -225,6 +327,11 @@ class BiEncoderForClassification(PreTrainedModel):
             )
            
         self.post_init()
+        self._paths = {
+            "single": SingleSentencePath(self),
+            "pair": PairSentencePath(self),
+            "triplet": TripletSentencePath(self),
+        }
         # 分類器をbackboneと同じdevice・dtypeに移動
         # print(f"dtype: {next(self.backbone.parameters()).dtype}, device: {next(self.backbone.parameters()).device}")
         for name, classifier in self.embedding_classifiers.items():
@@ -265,110 +372,55 @@ class BiEncoderForClassification(PreTrainedModel):
         inputs_embeds_3=None,
         **kwargs,
     ):
-        bsz = input_ids.size(0)
         device = next(self.backbone.parameters()).device
 
-        partitions = compute_sentence_partitions(
+        batch_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+            "position_ids": position_ids,
+            "head_mask": head_mask,
+            "inputs_embeds": inputs_embeds,
+            "input_ids_2": input_ids_2,
+            "attention_mask_2": attention_mask_2,
+            "token_type_ids_2": token_type_ids_2,
+            "position_ids_2": position_ids_2,
+            "head_mask_2": head_mask_2,
+            "inputs_embeds_2": inputs_embeds_2,
+            "input_ids_3": input_ids_3,
+            "attention_mask_3": attention_mask_3,
+            "token_type_ids_3": token_type_ids_3,
+            "position_ids_3": position_ids_3,
+            "head_mask_3": head_mask_3,
+            "inputs_embeds_3": inputs_embeds_3,
+        }
+        extra_kwargs = dict(kwargs)
+        partitioner = BatchPartitioner(
             attention_mask=attention_mask,
             attention_mask_2=attention_mask_2,
             attention_mask_3=attention_mask_3,
         )
-        has_second = partitions["has_second"]
-        has_third = partitions["has_third"]
-        has_only_first = partitions["has_only_first"]
 
-        # --- ２）全サンプル同一パスならそのまま処理 ---
-        if has_only_first.all():
-            outputs = self.encode(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                head_mask=head_mask,
-                inputs_embeds=inputs_embeds,
-            )
-            embeddings = outputs.get("original")
-            if embeddings is None:
-                raise ValueError("encode() did not return 'original' embeddings for single-sentence input.")
-            outputs["embeddings"] = embeddings
+        uniform = partitioner.uniform_kind()
+        if uniform:
+            outputs = self._paths[uniform].run_full(batch_inputs, extra_kwargs)
+            if uniform == "single":
+                embeddings = outputs.get("original")
+                if embeddings is None:
+                    raise ValueError("encode() did not return 'original' embeddings for single-sentence input.")
+                outputs.setdefault("embeddings", embeddings)
             return outputs
 
-        if has_third.all():
-            # 全部３文サンプル
-            return self.triplet_encode(
-                input_ids, attention_mask, token_type_ids, position_ids, head_mask, inputs_embeds,
-                input_ids_2, attention_mask_2, token_type_ids_2, position_ids_2, head_mask_2, inputs_embeds_2,
-                input_ids_3, attention_mask_3, token_type_ids_3, position_ids_3, head_mask_3, inputs_embeds_3,
-                **kwargs
-            )
-        if (~has_third).all() and has_second.all():
-            # 全部２文サンプル
-            return self._forward_binary(
-                input_ids, attention_mask, token_type_ids, position_ids, head_mask, inputs_embeds,
-                input_ids_2, attention_mask_2, token_type_ids_2, position_ids_2, head_mask_2, inputs_embeds_2,
-                **kwargs
-            )
+        outputs_by_kind = {}
+        for kind, path in self._paths.items():
+            outputs = path.run_partition(batch_inputs, partitioner, device, extra_kwargs)
+            if kind == "single" and outputs and "embeddings" not in outputs:
+                embeddings = outputs.get("original")
+                if embeddings is not None:
+                    outputs["embeddings"] = embeddings
+            outputs_by_kind[kind] = outputs
 
-        # --- ３）混在していればインデックスで分割 ---
-        idx1 = partitions["idx_single"]
-        idx2 = partitions["idx_pair"]
-        idx3 = partitions["idx_triplet"]
-
-        def sel(x, idx):
-            # x が None でなければ必ず model デバイスへ
-            return x[idx].to(device) if x is not None else None
-
-        # １文サブバッチ
-        if idx1.numel() == 0:
-            out1 = {}
-        else:
-            out1 = self.encode(
-                input_ids=sel(input_ids, idx1),
-                attention_mask=sel(attention_mask, idx1),
-                token_type_ids=sel(token_type_ids, idx1),
-                position_ids=sel(position_ids, idx1),
-                head_mask=sel(head_mask, idx1),
-                inputs_embeds=sel(inputs_embeds, idx1),
-            )
-            embeddings = out1.get("original")
-            if embeddings is None:
-                raise ValueError("encode() did not return 'original' embeddings for single-sentence input.")
-            out1["embeddings"] = embeddings
-
-        # ２文サブバッチ
-        if idx2.numel() == 0:
-            out2 = {}
-        else:
-            out2 = self._forward_binary(
-                sel(input_ids, idx2), sel(attention_mask, idx2), sel(token_type_ids, idx2),
-                sel(position_ids, idx2), sel(head_mask, idx2), sel(inputs_embeds, idx2),
-                sel(input_ids_2, idx2), sel(attention_mask_2, idx2), sel(token_type_ids_2, idx2),
-                sel(position_ids_2, idx2), sel(head_mask_2, idx2), sel(inputs_embeds_2, idx2),
-                **kwargs
-            )
-            
-        # ３文サブバッチ
-        if idx3.numel() == 0:
-            out3 = {}
-        else:
-            out3 = self.triplet_encode(
-                sel(input_ids, idx3), sel(attention_mask, idx3), sel(token_type_ids, idx3),
-                sel(position_ids, idx3), sel(head_mask, idx3), sel(inputs_embeds, idx3),
-                sel(input_ids_2, idx3), sel(attention_mask_2, idx3), sel(token_type_ids_2, idx3),
-                sel(position_ids_2, idx3), sel(head_mask_2, idx3), sel(inputs_embeds_2, idx3),
-                sel(input_ids_3, idx3), sel(attention_mask_3, idx3), sel(token_type_ids_3, idx3),
-                sel(position_ids_3, idx3), sel(head_mask_3, idx3), sel(inputs_embeds_3, idx3),
-                **kwargs
-            )
-
-        # --- ４）サブバッチの出力を元順序にマージ ---
-        return merge_indexed_outputs(
-            bsz,
-            device,
-            (idx1, out1),
-            (idx2, out2),
-            (idx3, out3),
-        )
+        return partitioner.merge(outputs_by_kind, device=device)
 
 
     # ── それぞれのパスで“本体”を切り出すヘルパー例 ──
@@ -493,7 +545,8 @@ class BiEncoderForClassification(PreTrainedModel):
             
             features = self.pooler(attention_mask, outputs)
 
-            outputs_dict["original"] =  features  # original embedding
+            outputs_dict["original"] = features  # original embedding
+            outputs_dict.setdefault("embeddings", features)
             return outputs_dict
     
     def classify(            
