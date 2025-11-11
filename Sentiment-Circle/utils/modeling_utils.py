@@ -1,4 +1,4 @@
-from .modeling_encoders import BiEncoderForClassification
+from modeling_encoders import BiEncoderForClassification
 import torch
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional

@@ -1,4 +1,5 @@
 #!/bin/bash
+source ../env/.venv/bin/activate
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -41,8 +42,6 @@ cat <<JSON >"${CONFIG_PATH}"
 }
 JSON
 
-export WANDB_MODE=${WANDB_MODE:-disabled}
-export WANDB_DISABLED=${WANDB_DISABLED:-true}
 WANDB_PROJECT_NAME=${WANDB_PROJECT_NAME:-sentiment_info_nce}
 WANDB_PROJECT=${WANDB_PROJECT:-sentiment_circle}
 mkdir -p "${OUTPUT_DIR}/${WANDB_PROJECT}/${WANDB_PROJECT_NAME}"

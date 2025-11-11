@@ -4,22 +4,14 @@ from torch import nn
 from torch.nn.functional import cosine_similarity
 import torch.nn.functional as F
 
-from transformers.activations import ACT2FN
-from transformers.modeling_outputs import (
-    SequenceClassifierOutput,
-)
-from transformers import PreTrainedModel, AutoModel, AutoConfig, BertModel
+from transformers import PreTrainedModel, AutoModel
 import logging
-from .modeling_config import (
-    LinearLayerConfig,
-    MLP2LayerConfig,
-    ContrastiveClassifierConfig,
+from modeling_config import (
     build_classifiers,
     load_classifiers
 )
 import os
-from .modeling_classifier import LinearLayer, MLP2Layer, ContrastiveClassifier
-from .sentence_batch_utils import BatchPartitioner
+from sentence_batch_utils import BatchPartitioner
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s: %(message)s')
 

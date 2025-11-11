@@ -2,8 +2,8 @@ import json
 import os
 import torch.nn as nn
 import torch
-from .modeling_classifier import LinearLayer, MLP2Layer, ContrastiveClassifier
-from typing import Dict, List, Optional
+from modeling_classifier import LinearLayer, MLP2Layer, ContrastiveClassifier
+from typing import Dict, List
 
 class LinearLayerConfig:
     def __init__(

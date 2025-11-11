@@ -1,0 +1,46 @@
+/remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/utils/clf_trainer.py:66: FutureWarning: `tokenizer` is deprecated and will be removed in version 5.0.0 for `CustomTrainer.__init__`. Use `processing_class` instead.
+  super().__init__(*args, **kwargs)
+[INFO|trainer.py:749] 2025-11-11 20:54:11,070 >> Using auto half precision backend
+[WARNING|trainer_callback.py:469] 2025-11-11 20:54:11,129 >> You are adding a <class 'progress_logger.LogCallback'> to the callbacks of this Trainer, but there is already one. The currentlist of callbacks is
+:DefaultFlowCallback
+WandbCallback
+LogCallback
+ProgressCallback
+[INFO|trainer.py:1012] 2025-11-11 20:54:11,129 >> The following columns in the Evaluation set don't have a corresponding argument in `BiEncoderForClassification.forward` and have been ignored: active_heads, labels. If active_heads, labels are not expected by `BiEncoderForClassification.forward`,  you can safely ignore this message.
+[INFO|trainer.py:4643] 2025-11-11 20:54:11,131 >>
+***** Running Evaluation *****
+[INFO|trainer.py:4645] 2025-11-11 20:54:11,132 >>   Num examples = 948
+[INFO|trainer.py:4648] 2025-11-11 20:54:11,132 >>   Batch size = 512
+Traceback (most recent call last):
+  File "/remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/utils/train.py", line 805, in <module>
+    main()
+  File "/remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/utils/train.py", line 749, in main
+    trainer.evaluate(eval_dataset=eval_dataset)
+  File "/remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/utils/clf_trainer.py", line 443, in evaluate
+    return super().evaluate(
+           ^^^^^^^^^^^^^^^^^
+  File "/remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/env/.venv/lib/python3.12/site-packages/transformers/trainer.py", line 4489, in evaluate
+    output = eval_loop(
+             ^^^^^^^^^^
+  File "/remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/utils/clf_trainer.py", line 459, in evaluation_loop
+    output = super().evaluation_loop(
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/env/.venv/lib/python3.12/site-packages/transformers/trainer.py", line 4675, in evaluation_loop
+    for step, inputs in enumerate(dataloader):
+                        ^^^^^^^^^^^^^^^^^^^^^
+  File "/remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/env/.venv/lib/python3.12/site-packages/accelerate/data_loader.py", line 567, in __iter__
+    current_batch = next(dataloader_iter)
+                    ^^^^^^^^^^^^^^^^^^^^^
+  File "/remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/env/.venv/lib/python3.12/site-packages/torch/utils/data/dataloader.py", line 732, in __next__
+    data = self._next_data()
+           ^^^^^^^^^^^^^^^^^
+  File "/remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/env/.venv/lib/python3.12/site-packages/torch/utils/data/dataloader.py", line 788, in _next_data
+    data = self._dataset_fetcher.fetch(index)  # may raise StopIteration
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/env/.venv/lib/python3.12/site-packages/torch/utils/data/_utils/fetch.py", line 55, in fetch
+    return self.collate_fn(data)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/utils/modeling_utils.py", line 15, in __call__
+    active_heads = [f["active_heads"] for f in features]
+                    ~^^^^^^^^^^^^^^^^
+KeyError: 'active_heads'

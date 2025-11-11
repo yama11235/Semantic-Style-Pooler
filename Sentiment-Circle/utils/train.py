@@ -15,19 +15,15 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import datasets
-import numpy as np
 import transformers
-from datasets import load_dataset, Features, Value
+from datasets import load_dataset
 from transformers import (
     AutoConfig,
     AutoTokenizer,
-    EvalPrediction,
     HfArgumentParser,
     PrinterCallback,
-    Trainer,
 )
 from transformers import TrainingArguments as HFTrainingArguments
-from transformers import default_data_collator, set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
 from progress_logger import LogCallback
@@ -38,8 +34,8 @@ from metrics import compute_metrics
 from functools import partial
 import wandb
 import torch
-from datasets import concatenate_datasets, DatasetDict, Dataset
-from typing import List, Dict, Any, Union, Optional
+from datasets import concatenate_datasets, DatasetDict
+from typing import List, Union, Optional
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s: %(message)s"
@@ -457,7 +453,16 @@ def main():
     #     logger.warning(
     #         f"Setting max_similarity: {data_args.max_similarity}. Override by setting --max_similarity."
     #     )        
-    
+
+    labels = []
+    for key in raw_datasets["validation"].features.keys():
+        labels.append(key)
+    labels.remove("sentence1")
+    if "sentence2" in labels:
+        labels.remove("sentence2")
+    if "sentence3" in labels:
+        labels.remove("sentence3")
+
     id2label = {i: aspect for i, aspect in enumerate(list(labels))}
     label2id = {aspect: i for i, aspect in enumerate(list(labels))}
 

@@ -1,0 +1,140 @@
+_wandb:
+    value:
+        cli_version: 0.22.3
+        e:
+            lowo3qqfczfz8fppgqr1a408ad7qd3mc:
+                args:
+                    - --model_name_or_path
+                    - mixedbread-ai/mxbai-embed-large-v1
+                    - --output_dir
+                    - /remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/outputs/sentiment_info_nce
+                    - --train_file
+                    - /remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/dataset/Train_df.csv
+                    - --validation_file
+                    - /remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/dataset/Valid_df.csv
+                    - --test_file
+                    - /remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/dataset/Test_df.csv
+                    - --classifier_configs
+                    - /remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/outputs/sentiment_info_nce/classifier_config.json
+                    - --encoding_type
+                    - bi_encoder
+                    - --pooler_type
+                    - avg
+                    - --max_seq_length
+                    - "256"
+                    - --per_device_train_batch_size
+                    - "128"
+                    - --per_device_eval_batch_size
+                    - "256"
+                    - --gradient_accumulation_steps
+                    - "1"
+                    - --learning_rate
+                    - "1e-4"
+                    - --num_train_epochs
+                    - "10"
+                    - --warmup_ratio
+                    - "0.1"
+                    - --lr_scheduler_type
+                    - linear
+                    - --logging_steps
+                    - "50"
+                    - --eval_steps
+                    - "50"
+                    - --eval_strategy
+                    - steps
+                    - --save_strategy
+                    - "no"
+                    - --do_train
+                    - --do_eval
+                    - --do_predict
+                    - --seed
+                    - "42"
+                    - --fp16
+                    - "true"
+                    - --bf16
+                    - "false"
+                    - --freeze_encoder
+                    - "true"
+                    - --overwrite_output_dir
+                    - "True"
+                    - --wandb_project_name
+                    - sentiment_info_nce
+                    - --wandb_project
+                    - sentiment_circle
+                    - --report_to
+                    - wandb
+                codePath: Sentiment-Circle/utils/train.py
+                codePathLocal: train.py
+                cpu_count: 32
+                cpu_count_logical: 64
+                cudaVersion: "12.9"
+                disk:
+                    /:
+                        total: "965895782400"
+                        used: "144623058944"
+                email: 2959648335@g.ecc.u-tokyo.ac.jp
+                executable: /remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/env/.venv/bin/python
+                git:
+                    commit: 7798560009a70473583265fe71bdfe3d1ead9893
+                    remote: https://github.com/yama11235/Semantic-Style-Pooler.git
+                gpu: NVIDIA H100 NVL
+                gpu_count: 2
+                gpu_nvidia:
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "100485038080"
+                      name: NVIDIA H100 NVL
+                      uuid: GPU-30ea0bcd-6685-1705-3475-d3ad0b751f03
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "100485038080"
+                      name: NVIDIA H100 NVL
+                      uuid: GPU-b242fb44-5934-4986-066f-80ccc1de1e45
+                host: doremi
+                memory:
+                    total: "540725690368"
+                os: Linux-6.8.0-65-generic-x86_64-with-glibc2.35
+                program: /remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/utils/train.py
+                python: CPython 3.12.11
+                root: /remote/csifs1/disk3/users/yama11235/yama11235/Sentiment-Circle/utils
+                slurm:
+                    root: /opt/slurm/22.05.2
+                startedAt: "2025-11-11T11:54:02.011589Z"
+                writerId: lowo3qqfczfz8fppgqr1a408ad7qd3mc
+        m: []
+        python_version: 3.12.11
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 49
+                - 51
+                - 53
+                - 71
+            "2":
+                - 1
+                - 5
+                - 11
+                - 49
+                - 51
+                - 53
+                - 71
+            "3":
+                - 13
+                - 16
+            "4": 3.12.11
+            "5": 0.22.3
+            "6": 4.57.1
+            "12": 0.22.3
+            "13": linux-x86_64
+sentiment:
+    value:
+        distance: cosine
+        dropout: 0.1
+        inbatch_negative_pairs: 0
+        inbatch_positive_pairs: 0
+        objective: infoNCE
+        output_dim: 256
+        tau: 0.05
+        type: linear

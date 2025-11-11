@@ -8,23 +8,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from datasets import Dataset
-from lightgbm import LGBMClassifier
 from sklearn.manifold import TSNE
-from sklearn.metrics import accuracy_score, f1_score
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import LinearSVC
-from torch import Tensor
 from transformers import Trainer
 
 from typing import List, Dict, Any, Optional
 from collections import defaultdict
-from .sentence_batch_utils import (
+from sentence_batch_utils import (
     BatchPartitioner,
     extract_unique_strings,
     flatten_strings,
 )
-from .head_objectives import (
+from head_objectives import (
     AngleNCEObjective,
     BinaryClassificationObjective,
     ContrastiveLogitObjective,
