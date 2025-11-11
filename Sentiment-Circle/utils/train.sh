@@ -7,21 +7,21 @@ DATA_DIR="${PROJECT_ROOT}/dataset"
 OUTPUT_ROOT="${PROJECT_ROOT}/outputs"
 mkdir -p "${OUTPUT_ROOT}"
 
-MODEL_NAME=${MODEL:-sentence-transformers/all-MiniLM-L12-v2}
+MODEL_NAME=${MODEL:-mixedbread-ai/mxbai-embed-large-v1}
 POOLER_TYPE=${POOLER_TYPE:-avg}
 MAX_SEQ_LEN=${MAX_SEQ_LENGTH:-256}
-LEARNING_RATE=${LR:-3e-5}
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
-EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-128}
+LEARNING_RATE=${LR:-1e-4}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-128}
+EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-256}
 NUM_EPOCHS=${NUM_EPOCHS:-10}
 GRAD_ACCUM=${GRADIENT_ACCUMULATION_STEPS:-1}
 TAU=${TAU:-0.05}
 POS_PAIRS=${INBATCH_POS_PAIRS:-0}
 NEG_PAIRS=${INBATCH_NEG_PAIRS:-0}
 SEED=${SEED:-42}
-FP16=${FP16:-false}
+FP16=${FP16:-true}
 BF16=${BF16:-false}
-FREEZE_ENCODER=${FREEZE_ENCODER:-false}
+FREEZE_ENCODER=${FREEZE_ENCODER:-true}
 OUTPUT_DIR="${OUTPUT_ROOT}/sentiment_info_nce"
 mkdir -p "${OUTPUT_DIR}"
 
@@ -43,6 +43,9 @@ JSON
 
 export WANDB_MODE=${WANDB_MODE:-disabled}
 export WANDB_DISABLED=${WANDB_DISABLED:-true}
+WANDB_PROJECT_NAME=${WANDB_PROJECT_NAME:-sentiment_info_nce}
+WANDB_PROJECT=${WANDB_PROJECT:-sentiment_circle}
+mkdir -p "${OUTPUT_DIR}/${WANDB_PROJECT}/${WANDB_PROJECT_NAME}"
 
 python "${SCRIPT_DIR}/train.py" \
   --model_name_or_path "${MODEL_NAME}" \
@@ -62,8 +65,8 @@ python "${SCRIPT_DIR}/train.py" \
   --warmup_ratio 0.1 \
   --lr_scheduler_type linear \
   --logging_steps 50 \
-  --eval_steps 200 \
-  --evaluation_strategy steps \
+  --eval_steps 50 \
+  --eval_strategy steps \
   --save_strategy no \
   --do_train \
   --do_eval \
@@ -73,5 +76,6 @@ python "${SCRIPT_DIR}/train.py" \
   --bf16 ${BF16} \
   --freeze_encoder ${FREEZE_ENCODER} \
   --overwrite_output_dir True \
-  --wandb_project_name sentiment_info_nce \
-  --wandb_project sentiment_circle
+  --wandb_project_name ${WANDB_PROJECT_NAME} \
+  --wandb_project ${WANDB_PROJECT} \
+  --report_to wandb > "${OUTPUT_DIR}/${WANDB_PROJECT}/${WANDB_PROJECT_NAME}/train.log" 2>&1
