@@ -199,6 +199,30 @@ def compute_metrics(eval_pred: EvalPrediction,
                 metrics[f"{head}_single-pearson"] = float(pear)
                 metrics[f"{head}_single-spearman"] = float(spearmanr(scores, truths).correlation)
 
+        elif obj == "infoNCE":
+            if "embeddings" not in preds:
+                continue
+            embeddings = np.asarray(preds["embeddings"], dtype=float)
+            if embeddings.ndim != 2:
+                continue
+            mask = np.asarray(idx, dtype=bool)
+            emb_subset = embeddings[mask]
+            label_subset = labels[mask].astype(int) if len(labels) else np.array([], dtype=int)
+            if emb_subset.shape[0] <= 1:
+                continue
+            norms = np.linalg.norm(emb_subset, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1.0, norms)
+            normalized = emb_subset / norms
+            similarity = normalized @ normalized.T
+            np.fill_diagonal(similarity, -np.inf)
+            nn_indices = np.argmax(similarity, axis=1)
+            y_pred = label_subset[nn_indices]
+            if label_subset.size > 0:
+                acc = accuracy_score(label_subset, y_pred)
+                f1 = f1_score(label_subset, y_pred, average="macro")
+                metrics[f"{head}_knn_accuracy"] = float(acc)
+                metrics[f"{head}_knn_macro_f1"] = float(f1)
+
         elif obj == "contrastive_logit":
             # 3文タスク: pos/neg を縦連結してベクトル化
 
