@@ -231,7 +231,7 @@ class Pooler(nn.Module):
         last_hidden = outputs.last_hidden_state
         hidden_states = outputs.hidden_states
         dtype = last_hidden.dtype
-        print(f"dtype in Pooler: {dtype}")
+        # print(f"dtype in Pooler: {dtype}")
 
         if self.pooler_type in ['cls_before_pooler', 'cls']:
             return last_hidden[:, 0]
@@ -328,41 +328,24 @@ class BiEncoderForClassification(PreTrainedModel):
             "triplet": TripletSentencePath(self),
         }
         # 分類器をbackboneと同じdevice・dtypeに移動
-        print(f"dtype: {next(self.backbone.parameters()).dtype}, device: {next(self.backbone.parameters()).device}")
+        # print(f"dtype: {next(self.backbone.parameters()).dtype}, device: {next(self.backbone.parameters()).device}")
         backbone_device = next(self.backbone.parameters()).device
         for name, classifier in self.embedding_classifiers.items():
             classifier.to(device=backbone_device)
-            classifier_dtype = next(classifier.parameters()).dtype
+            classifier.to(dtype=next(self.backbone.parameters()).dtype)
             # # ダミー入力（バッチサイズ1, 入力次元2560、backboneと同じdevice・分類器のdtypeで作成）
-            dummy_input = torch.randn(1, 1024, device=backbone_device, dtype=classifier_dtype)
+            dummy_input = torch.randn(1, 1024, device=backbone_device, dtype=next(classifier.parameters()).dtype)
 
             # # 入力のdtype
-            print("入力のdtype:", dummy_input.dtype)
+            # print("入力のdtype:", dummy_input.dtype)
 
             # # 出力を得る
             output = classifier(dummy_input)
 
             # # 出力のdtype
-            print("出力のdtype:", output.dtype if isinstance(output, torch.Tensor) else type(output))
+            # print("出力のdtype:", output.dtype if isinstance(output, torch.Tensor) else type(output))
 
 
-    def _cast_classifier_inputs(self, classifier, *tensors):
-        """Cast tensors to the dtype expected by the classifier parameters."""
-        try:
-            target_dtype = next(classifier.parameters()).dtype
-        except StopIteration:
-            target_dtype = None
-
-        casted = []
-        for tensor in tensors:
-            if target_dtype is not None and isinstance(tensor, torch.Tensor) and tensor.dtype != target_dtype:
-                casted.append(tensor.to(dtype=target_dtype))
-            else:
-                casted.append(tensor)
-
-        if len(casted) == 1:
-            return casted[0]
-        return tuple(casted)
 
     def forward(
         self,
@@ -424,7 +407,7 @@ class BiEncoderForClassification(PreTrainedModel):
                 if embeddings is None:
                     raise ValueError("encode() did not return 'original' embeddings for single-sentence input.")
                 outputs.setdefault("embeddings", embeddings)
-            print(f"dtype of outputs: { {k: v.dtype for k, v in outputs.items()} }")
+            # print(f"dtype of outputs: { {k: v.dtype for k, v in outputs.items()} }")
             return outputs
 
         outputs_by_kind = {}
@@ -482,9 +465,6 @@ class BiEncoderForClassification(PreTrainedModel):
                 # siamese 用に、2*bsz の出力をそれぞれ前半と後半に分割する
                 # print(f"bsz: {bsz}, pooled_features shape: {pooled_features.shape}")
                 features1, features2 = torch.split(pooled_features, bsz, dim=0)
-                features1, features2 = self._cast_classifier_inputs(
-                    classifier, features1, features2
-                )
                 # print(f"features1: {features1}, features2: {features2}")
 
                 if self.classifier_configs[name]["type"] != "contrastive_logit":
@@ -550,16 +530,16 @@ class BiEncoderForClassification(PreTrainedModel):
                 inputs_embeds=inputs_embeds,
                 output_hidden_states=self.output_hidden_states,
                 )
-            print(f"dtype in encode: {outputs.last_hidden_state.dtype}")
+
             outputs_dict = {}
             if self.classifier_configs:
                 for name, classifier in self.embedding_classifiers.items():
                     target_layer = int(self.classifier_configs[name]["layer"])
                     pooled_features = self.pooler(attention_mask, outputs, target_layer)
-                    pooled_features = self._cast_classifier_inputs(
-                        classifier, pooled_features
-                    )
-                    embedding = classifier.encode(pooled_features)
+                    # print(f"pooled_features dtype for classifier {name}: {pooled_features.dtype}")
+                    # print(classifier)
+                    embedding = classifier.encode(pooled_features).to(pooled_features.dtype)
+                    # print(f"embedding dtype for classifier {name}: {embedding.dtype}")
                     outputs_dict[name] = embedding
             
             features = self.pooler(attention_mask, outputs)
@@ -598,9 +578,6 @@ class BiEncoderForClassification(PreTrainedModel):
 
                     target_layer = int(self.classifier_configs[name]["layer"])
                     pooled_features = self.pooler(attention_mask, outputs, target_layer)
-                    pooled_features = self._cast_classifier_inputs(
-                        classifier, pooled_features
-                    )
 
                     embedding, prob = classifier(pooled_features)
                     outputs_dict[f"{name}_prob"] = prob  # probability for classification
@@ -659,9 +636,6 @@ class BiEncoderForClassification(PreTrainedModel):
 
                 # siamese 用に、3*bsz の出力をそれぞれ前半、中間、後半に分割する
                 features1, features2, features3 = torch.split(pooled_features, [bsz1, bsz2, bsz3], dim=0)
-                features1, features2, features3 = self._cast_classifier_inputs(
-                    classifier, features1, features2, features3
-                )
 
                 if self.classifier_configs[name]["type"] != "contrastive_logit":
                     output1 = classifier(features1)  # sentence1用

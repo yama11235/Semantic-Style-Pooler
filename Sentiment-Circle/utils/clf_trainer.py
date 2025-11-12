@@ -71,7 +71,7 @@ class CustomTrainer(Trainer):
         self._tsne_current_dataset = None
         self._last_eval_predictions: Optional[Any] = None
         self._last_eval_label_ids: Optional[Any] = None
-        self._cached_train_centroids: Optional[Dict[str, Dict[int, np.ndarray]]] = None
+        self._cached_train_centroids: Optional[Dict[str, Dict[str, Dict[int, np.ndarray]]]] = None
         self._train_centroids_dirty: bool = True
         self.tsne_label_mappings: Dict[str, Dict[int, str]] = tsne_label_mappings or {}
 
@@ -125,6 +125,8 @@ class CustomTrainer(Trainer):
 
         if self.tsne_save_dir is not None:
             os.makedirs(self.tsne_save_dir, exist_ok=True)
+        self._initial_eval_completed = False
+        self._current_eval_embedding_mode = "classifier"
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
@@ -160,19 +162,19 @@ class CustomTrainer(Trainer):
         outputs1: Dict[str, torch.Tensor] = {}
         if inputs1:
             outputs1 = model(**inputs1)
-            embeddings1 = outputs1.get("embeddings")
-            if embeddings1 is None:
-                raise ValueError("Model did not return 'embeddings' for single-sentence inputs.")
             for head in active_heads:
                 objective = self.head_objectives.get(head)
                 if objective is None:
+                    continue
+                head_output = outputs1.get(head)
+                if head_output is None:
                     continue
                 mask = self._head_mask(inputs1.get("active_heads"), head, device)
                 if mask is None or mask.sum() == 0:
                     continue
                 if labels1 is None:
                     continue
-                sub_emb = embeddings1[mask]
+                sub_emb = head_output[mask]
                 sub_tgt = labels1[mask].flatten()
                 valid = self._finite_mask(sub_tgt)
                 if valid.sum() == 0:
@@ -184,7 +186,8 @@ class CustomTrainer(Trainer):
                 loss = objective.compute_single(self, sub_emb, sub_tgt)
                 if loss is not None:
                     total_loss = total_loss + loss
-                    print(f"Loss for head '{head}' (single total): {total_loss.item()}")
+                    # print(f"Loss for head '{head}' (single total): {total_loss.item()}")
+                    # print(f"loss dtype : {loss.dtype}, total_loss dtype: {total_loss.dtype}")
 
         outputs2: Dict[str, torch.Tensor] = {}
         if inputs2:
@@ -326,7 +329,7 @@ class CustomTrainer(Trainer):
         return total_loss, full_outputs
 
     def training_step(self, model, inputs, num_items_in_batch: Optional[int] = None):
-        print("Starting training step...")
+        # print("Starting training step...")
         output = super().training_step(model, inputs, num_items_in_batch)
         self._train_centroids_dirty = True
         return output
@@ -384,7 +387,8 @@ class CustomTrainer(Trainer):
 
             log_prob = torch.log(numer.clamp_min(eps)) - torch.log(denom)
             loss = -(log_prob.squeeze(1)[valid]).mean()
-            print(f"infoNCE loss (full pairs): {loss.item()}")
+            # print(f"infoNCE loss (full pairs): {loss.item()}")
+            # print(f"loss dtype: {loss.dtype}")
             return loss
 
         # --- 上限付きサンプリング（互換用） ---
@@ -416,7 +420,7 @@ class CustomTrainer(Trainer):
         if not losses:
             return None
 
-        print(f"infoNCE loss (sampled pairs): {torch.stack(losses).mean().item()}")
+        # print(f"infoNCE loss (sampled pairs): {torch.stack(losses).mean().item()}")
         return torch.stack(losses).mean()
 
     def evaluation_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
@@ -424,7 +428,7 @@ class CustomTrainer(Trainer):
         with torch.no_grad():
             loss, logits = self.compute_loss(model, inputs, return_outputs=True)
 
-        print(f"eval loss: {loss}")
+        # print(f"eval loss: {loss}")
         labels_tensor = inputs["labels"]  # torch.Tensor
         # 文字列 → 整数に変換
         ah_list = flatten_strings(inputs["active_heads"])  # 例: ["emotion", "emotion", ...]
@@ -451,6 +455,9 @@ class CustomTrainer(Trainer):
         dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         previous_dataset = self._tsne_current_dataset
         self._tsne_current_dataset = dataset
+        global_step = self.state.global_step if self.state is not None else 0
+        use_original_now = (not self._initial_eval_completed) and global_step == 0
+        self._current_eval_embedding_mode = "original" if use_original_now else "classifier"
         try:
             return super().evaluate(
                 eval_dataset=eval_dataset,
@@ -458,6 +465,9 @@ class CustomTrainer(Trainer):
                 metric_key_prefix=metric_key_prefix,
             )
         finally:
+            if self._current_eval_embedding_mode == "original":
+                self._initial_eval_completed = True
+            self._current_eval_embedding_mode = "classifier"
             self._tsne_current_dataset = previous_dataset
 
     def evaluation_loop(
@@ -489,7 +499,7 @@ class CustomTrainer(Trainer):
 
         return output
 
-    def get_train_label_centroids(self) -> Dict[str, Dict[int, np.ndarray]]:
+    def get_train_label_centroids(self) -> Dict[str, Dict[str, Dict[int, np.ndarray]]]:
         if self.train_dataset is None:
             return {}
         if not self._train_centroids_dirty and self._cached_train_centroids is not None:
@@ -499,7 +509,7 @@ class CustomTrainer(Trainer):
         self._train_centroids_dirty = False
         return centroids
 
-    def _build_train_label_centroids(self) -> Dict[str, Dict[int, np.ndarray]]:
+    def _build_train_label_centroids(self) -> Dict[str, Dict[str, Dict[int, np.ndarray]]]:
         dataset = self.train_dataset
         if dataset is None:
             return {}
@@ -509,36 +519,48 @@ class CustomTrainer(Trainer):
         was_training = model.training
         model.eval()
 
-        head_sums: Dict[str, Dict[int, np.ndarray]] = defaultdict(dict)
-        head_counts: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        head_sums_classifier: Dict[str, Dict[int, np.ndarray]] = defaultdict(dict)
+        head_counts_classifier: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        head_sums_original: Dict[str, Dict[int, np.ndarray]] = defaultdict(dict)
+        head_counts_original: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
 
         with torch.no_grad():
             for batch in dataloader:
                 inputs = self._prepare_inputs(batch)
                 _, outputs = self.compute_loss(model, inputs, return_outputs=True)
-                embeddings = outputs.get("embeddings")
-                if embeddings is None:
-                    continue
-                emb = embeddings.detach().cpu().numpy()
-                if emb.ndim != 2 or emb.shape[0] == 0:
-                    continue
-
                 labels_tensor = inputs.get("labels")
                 if labels_tensor is None:
                     continue
                 labels_np = labels_tensor.detach().cpu().view(-1).numpy()
+                batch_size = labels_np.shape[0]
+
+                original_embeddings = outputs.get("embeddings")
+                original_np = None
+                if original_embeddings is not None:
+                    original_np = original_embeddings.detach().cpu().numpy()
+                    if original_np.ndim != 2 or original_np.shape[0] == 0:
+                        original_np = None
+
+                head_arrays: Dict[str, np.ndarray] = {}
+                for head_name, cfg in self.classifier_configs.items():
+                    if cfg.get("objective") != "infoNCE":
+                        continue
+                    head_tensor = outputs.get(head_name)
+                    if head_tensor is None:
+                        continue
+                    arr = head_tensor.detach().cpu().numpy()
+                    if arr.ndim != 2 or arr.shape[0] == 0:
+                        continue
+                    head_arrays[head_name] = arr
 
                 active_heads_field = inputs.get("active_heads", [])
                 head_list = flatten_strings(active_heads_field)
-                if len(head_list) < emb.shape[0]:
-                    head_list = head_list + [""] * (emb.shape[0] - len(head_list))
-                elif len(head_list) > emb.shape[0]:
-                    head_list = head_list[: emb.shape[0]]
+                if len(head_list) < batch_size:
+                    head_list = head_list + [""] * (batch_size - len(head_list))
+                elif len(head_list) > batch_size:
+                    head_list = head_list[:batch_size]
 
-                valid_mask = np.isfinite(emb).all(axis=1)
-                for idx, is_valid in enumerate(valid_mask):
-                    if not is_valid:
-                        continue
+                for idx in range(batch_size):
                     if idx >= len(labels_np):
                         continue
                     head_name = head_list[idx] if idx < len(head_list) else None
@@ -551,25 +573,65 @@ class CustomTrainer(Trainer):
                     if not np.isfinite(label_value):
                         continue
                     label_int = int(label_value)
-                    vector = emb[idx]
-                    sums_for_head = head_sums[head_name]
-                    if label_int in sums_for_head:
-                        sums_for_head[label_int] += vector
-                    else:
-                        sums_for_head[label_int] = vector.copy()
-                    head_counts[head_name][label_int] += 1
+
+                    classifier_arr = head_arrays.get(head_name)
+                    vector_classifier = None
+                    if classifier_arr is not None and idx < classifier_arr.shape[0]:
+                        vector_classifier = classifier_arr[idx]
+                        if not np.isfinite(vector_classifier).all():
+                            vector_classifier = None
+
+                    vector_original = None
+                    if original_np is not None and idx < original_np.shape[0]:
+                        vector_original = original_np[idx]
+                        if not np.isfinite(vector_original).all():
+                            vector_original = None
+
+                    if vector_classifier is not None:
+                        sums_for_head = head_sums_classifier[head_name]
+                        if label_int in sums_for_head:
+                            sums_for_head[label_int] += vector_classifier
+                        else:
+                            sums_for_head[label_int] = vector_classifier.copy()
+                        head_counts_classifier[head_name][label_int] += 1
+
+                    if vector_original is not None:
+                        sums_for_original = head_sums_original[head_name]
+                        if label_int in sums_for_original:
+                            sums_for_original[label_int] += vector_original
+                        else:
+                            sums_for_original[label_int] = vector_original.copy()
+                        head_counts_original[head_name][label_int] += 1
 
         if was_training:
             model.train()
 
-        centroids: Dict[str, Dict[int, np.ndarray]] = {}
-        for head_name, label_sums in head_sums.items():
+        centroids: Dict[str, Dict[str, Dict[int, np.ndarray]]] = {}
+        all_heads = set(head_sums_classifier.keys()) | set(head_sums_original.keys())
+        for head_name in all_heads:
             centroids[head_name] = {}
-            for label_value, vector_sum in label_sums.items():
-                count = head_counts[head_name][label_value]
-                if count <= 0:
-                    continue
-                centroids[head_name][label_value] = (vector_sum / count).astype(np.float32)
+            label_sums_classifier = head_sums_classifier.get(head_name, {})
+            if label_sums_classifier:
+                centroids[head_name]["classifier"] = {}
+                for label_value, vector_sum in label_sums_classifier.items():
+                    count = head_counts_classifier[head_name][label_value]
+                    if count <= 0:
+                        continue
+                    centroids[head_name]["classifier"][label_value] = (
+                        vector_sum / count
+                    ).astype(np.float32)
+            label_sums_original = head_sums_original.get(head_name, {})
+            if label_sums_original:
+                centroids[head_name]["original"] = {}
+                for label_value, vector_sum in label_sums_original.items():
+                    count = head_counts_original[head_name][label_value]
+                    if count <= 0:
+                        continue
+                    centroids[head_name]["original"][label_value] = (
+                        vector_sum / count
+                    ).astype(np.float32)
+            if not centroids[head_name]:
+                centroids.pop(head_name)
 
         return centroids
 
@@ -620,6 +682,10 @@ class CustomTrainer(Trainer):
                 names.append(None)
         return names
 
+    @property
+    def use_original_eval_embeddings(self) -> bool:
+        return self._current_eval_embedding_mode == "original"
+
     def _format_tsne_label_name(self, label_value: Any, head_name: Optional[str]) -> str:
         if label_value is None:
             return "Unlabeled"
@@ -648,19 +714,79 @@ class CustomTrainer(Trainer):
     def _save_tsne_plot(self, metric_key_prefix: str) -> None:
         if not isinstance(self._last_eval_predictions, dict):
             return
-        embeddings = self._last_eval_predictions.get("embeddings")
-        if embeddings is None:
+        if self.use_original_eval_embeddings:
+            embeddings = self._last_eval_predictions.get("embeddings")
+            emb_array = self._to_numpy(embeddings)
+            if emb_array is None or emb_array.ndim != 2 or emb_array.shape[0] < 2:
+                return
+            labels = self._extract_labels(self._last_eval_label_ids, emb_array.shape[0])
+            head_names = self._extract_active_head_names(self._last_eval_label_ids, emb_array.shape[0])
+            self._plot_tsne_embedding_space(
+                embeddings=emb_array,
+                labels=labels,
+                metric_key_prefix=metric_key_prefix,
+                head_name=None,
+                point_head_names=head_names,
+            )
+            return
+        plotted = False
+
+        for head_name in self.classifier_configs.keys():
+            head_preds = self._last_eval_predictions.get(head_name)
+            emb_array = self._to_numpy(head_preds)
+            if emb_array is None or emb_array.ndim != 2 or emb_array.shape[0] == 0:
+                continue
+
+            labels = self._extract_labels(self._last_eval_label_ids, emb_array.shape[0])
+            active_heads = self._extract_active_head_names(self._last_eval_label_ids, emb_array.shape[0])
+            mask = np.array([h == head_name for h in active_heads], dtype=bool)
+            if not mask.any():
+                continue
+
+            head_embeddings = emb_array[mask]
+            head_labels = labels[mask]
+            if head_embeddings.shape[0] < 2:
+                continue
+
+            self._plot_tsne_embedding_space(
+                embeddings=head_embeddings,
+                labels=head_labels,
+                metric_key_prefix=metric_key_prefix,
+                head_name=head_name,
+            )
+            plotted = True
+
+        if plotted:
             return
 
+        embeddings = self._last_eval_predictions.get("embeddings")
         emb_array = self._to_numpy(embeddings)
         if emb_array is None or emb_array.ndim != 2 or emb_array.shape[0] < 2:
             return
 
         labels = self._extract_labels(self._last_eval_label_ids, emb_array.shape[0])
         head_names = self._extract_active_head_names(self._last_eval_label_ids, emb_array.shape[0])
+        self._plot_tsne_embedding_space(
+            embeddings=emb_array,
+            labels=labels,
+            metric_key_prefix=metric_key_prefix,
+            head_name=None,
+            point_head_names=head_names,
+        )
 
-        perplexity = max(1, min(30, emb_array.shape[0] - 1))
-        if emb_array.shape[0] <= 2:
+    def _plot_tsne_embedding_space(
+        self,
+        embeddings: np.ndarray,
+        labels: np.ndarray,
+        metric_key_prefix: str,
+        head_name: Optional[str],
+        point_head_names: Optional[List[Optional[str]]] = None,
+    ) -> None:
+        if embeddings.ndim != 2 or embeddings.shape[0] < 2:
+            return
+
+        perplexity = max(1, min(30, embeddings.shape[0] - 1))
+        if embeddings.shape[0] <= 2:
             perplexity = 1
 
         tsne = TSNE(
@@ -669,14 +795,22 @@ class CustomTrainer(Trainer):
             random_state=getattr(self.args, "seed", 42) or 42,
             init="random",
         )
-        points_2d = tsne.fit_transform(emb_array)
+        points_2d = tsne.fit_transform(embeddings)
 
         os.makedirs(self.tsne_save_dir, exist_ok=True)
 
+        effective_heads: List[Optional[str]]
+        if point_head_names is not None:
+            effective_heads = list(point_head_names)
+        else:
+            effective_heads = [head_name] * embeddings.shape[0]
+
         fig, ax = plt.subplots(figsize=(8, 6))
         display_labels = np.array(
-            [self._format_tsne_label_name(label, head)
-             for label, head in zip(labels, head_names)],
+            [
+                self._format_tsne_label_name(label, effective_heads[idx] if idx < len(effective_heads) else head_name)
+                for idx, label in enumerate(labels)
+            ],
             dtype=object,
         )
         unique_display = np.unique(display_labels)
@@ -694,17 +828,22 @@ class CustomTrainer(Trainer):
                 edgecolors="none",
             )
 
-        ax.set_title("Evaluation Embeddings t-SNE")
+        title_prefix = head_name if head_name is not None else "original"
+        ax.set_title(f"{title_prefix} Embeddings t-SNE")
         ax.set_xlabel("Component 1")
         ax.set_ylabel("Component 2")
-        legend_title = "Label"
-        if any(head is not None for head in head_names):
+        if head_name:
+            legend_title = head_name
+        elif any(h is not None for h in effective_heads):
             legend_title = "Emotion"
+        else:
+            legend_title = "Label"
         ax.legend(loc="best", fontsize="small", title=legend_title)
         ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
 
         step = self.state.global_step if self.state is not None else 0
-        filename = f"{metric_key_prefix}_tsne_step-{step:06d}.png"
+        suffix = head_name if head_name is not None else "original"
+        filename = f"{metric_key_prefix}_{suffix}_tsne_step-{step:06d}.png"
         save_path = os.path.join(self.tsne_save_dir, filename)
         fig.tight_layout()
         fig.savefig(save_path, dpi=200)

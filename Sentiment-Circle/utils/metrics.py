@@ -86,11 +86,28 @@ def find_best_threshold(y_true, scores, n_thresholds=100):
 
     return float(best_thr), float(best_f1), float(best_acc)
 
+def _select_centroids(
+    entry: Optional[Dict],
+    mode: str,
+) -> Optional[Dict[int, np.ndarray]]:
+    if not entry:
+        return None
+    if isinstance(entry, dict) and any(
+        isinstance(k, str) and k in ("classifier", "original") for k in entry.keys()
+    ):
+        primary = "original" if mode == "original" else "classifier"
+        if entry.get(primary):
+            return entry[primary]
+        fallback = "classifier" if primary == "original" else "original"
+        return entry.get(fallback)
+    return entry
+
 def compute_metrics(
     eval_pred: EvalPrediction,
     classifier_configs: dict,
     id2_head: dict,
-    train_centroid_getter: Optional[Callable[[], Dict[str, Dict[int, np.ndarray]]]] = None,
+    train_centroid_getter: Optional[Callable[[], Dict[str, Dict[str, Dict[int, np.ndarray]]]]] = None,
+    embedding_eval_mode: str = "classifier",
 ) -> dict:
     """
     - eval_pred.predictions は dict で、
@@ -102,6 +119,8 @@ def compute_metrics(
     - eval_pred.label_ids は shape (N,) の numpy array または tensor
     - classifier_configs に従い、サンプルごとに active_head を見てメトリックを計算
     - 最後に全 head ペア間の Pearson 相関を計算
+    - embedding_eval_mode: "classifier" の場合は各 head の埋め込みを使用、
+      "original" の場合はベース埋め込みで InfoNCE 評価を行う
     """
     preds = eval_pred.predictions
     label_dict = eval_pred.label_ids
@@ -206,9 +225,10 @@ def compute_metrics(
                 metrics[f"{head}_single-spearman"] = float(spearmanr(scores, truths).correlation)
 
         elif obj == "infoNCE":
-            if "embeddings" not in preds:
+            embedding_source = preds.get("embeddings") if embedding_eval_mode == "original" else preds.get(head)
+            if embedding_source is None:
                 continue
-            embeddings = np.asarray(preds["embeddings"], dtype=float)
+            embeddings = np.asarray(embedding_source, dtype=float)
             if embeddings.ndim != 2:
                 continue
             mask = np.asarray(idx, dtype=bool)
@@ -225,12 +245,17 @@ def compute_metrics(
             if emb_subset.shape[0] == 0:
                 continue
 
-            head_centroids = (train_centroids or {}).get(head)
+            head_centroids = _select_centroids(
+                (train_centroids or {}).get(head),
+                embedding_eval_mode,
+            )
             if not head_centroids:
                 continue
 
             centroid_labels = np.array(list(head_centroids.keys()), dtype=int)
-            centroid_vectors = np.asarray([head_centroids[label] for label in centroid_labels], dtype=float)
+            centroid_vectors = np.asarray(
+                [head_centroids[label] for label in centroid_labels], dtype=float
+            )
             if centroid_vectors.ndim != 2 or centroid_vectors.shape[0] == 0:
                 continue
             if centroid_vectors.shape[1] != emb_subset.shape[1]:

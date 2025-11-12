@@ -227,6 +227,7 @@ def load_classifiers(classifier_configs: Dict, model_config: Dict, save_dir: Lis
     Returns:
         ModuleDict of loaded classifier modules.
     """
+    print(f"model config in load_classifiers: {model_config}")
     modules, _ = build_classifiers(classifier_configs, model_config)
 
     for name, classifier_path in zip(list(modules.keys()), save_dir):

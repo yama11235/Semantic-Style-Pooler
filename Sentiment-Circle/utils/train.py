@@ -31,7 +31,6 @@ from dataset_preprocessing import get_preprocessing_function, parse_dict, batch_
 from modeling_utils import DataCollatorForBiEncoder, get_model
 from clf_trainer import CustomTrainer
 from metrics import compute_metrics
-from functools import partial
 import wandb
 import torch
 from datasets import concatenate_datasets, DatasetDict
@@ -691,7 +690,7 @@ def main():
             logger.info(f"tokens: {tokenizer.decode(input_ids)}")
             logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
-    collator_dtype = getattr(config, "torch_dtype", torch.float16)
+    collator_dtype = getattr(config, "torch_dtype", torch.float32)
 
     print(f"torch dtype: {config.torch_dtype}, collator_dtype: {collator_dtype}")
     data_collator = DataCollatorForBiEncoder(
@@ -722,20 +721,26 @@ def main():
             name=wandb_project_name,
         )
         
-    centroid_state = {"trainer": None}
+    trainer_state = {"trainer": None}
 
     def train_centroid_getter():
-        trainer_obj = centroid_state["trainer"]
+        trainer_obj = trainer_state["trainer"]
         if trainer_obj is None:
             return {}
         return trainer_obj.get_train_label_centroids()
 
-    compute_fn = partial(
-        compute_metrics,
-        classifier_configs=classifier_configs_for_trainer,
-        id2_head=id2_head,
-        train_centroid_getter=train_centroid_getter,
-    )
+    def compute_fn(eval_pred):
+        trainer_obj = trainer_state["trainer"]
+        embedding_mode = "classifier"
+        if trainer_obj is not None and trainer_obj.use_original_eval_embeddings:
+            embedding_mode = "original"
+        return compute_metrics(
+            eval_pred,
+            classifier_configs=classifier_configs_for_trainer,
+            id2_head=id2_head,
+            train_centroid_getter=train_centroid_getter,
+            embedding_eval_mode=embedding_mode,
+        )
     
     trainer = CustomTrainer(
         model=model,
@@ -753,7 +758,7 @@ def main():
         tsne_save_dir=os.path.join(training_args.output_dir, "tsne_plots"),
         tsne_label_mappings=label_name_mappings,
     )
-    centroid_state["trainer"] = trainer
+    trainer_state["trainer"] = trainer
     
     trainer.remove_callback(PrinterCallback)
     trainer.add_callback(LogCallback)
@@ -778,32 +783,8 @@ def main():
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
-    # Evaluation
-    combined = {}
-    if training_args.do_eval:
-        logger.info("*** Evaluate ***")
-        metrics = trainer.evaluate(eval_dataset=eval_dataset)
-        max_eval_samples = (
-            data_args.max_eval_samples
-            if data_args.max_eval_samples is not None
-            else len(eval_dataset)
-        )
-        metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
-        combined.update(metrics)
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", combined)
-        if training_args.do_train:
-            metrics = trainer.evaluate(
-                eval_dataset=train_dataset, metric_key_prefix="train"
-            )
-            max_eval_samples = (
-                data_args.max_eval_samples
-                if data_args.max_eval_samples is not None
-                else len(eval_dataset)
-            )
-            metrics["train_samples"] = min(max_eval_samples, len(train_dataset))
-            trainer.log_metrics("train", metrics)
-            trainer.save_metrics("train", combined)
+        
+    # Test
     if training_args.do_predict:
         logger.info("*** Test ***")
         metrics = trainer.evaluate(eval_dataset=predict_dataset)
