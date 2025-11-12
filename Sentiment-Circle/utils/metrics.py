@@ -6,10 +6,12 @@ from sklearn.metrics import (
     accuracy_score,
     f1_score,
     roc_auc_score,
+    adjusted_mutual_info_score,
+    v_measure_score,
 )
 from itertools import combinations
 import math
-from typing import Union, List
+from typing import Union, List, Dict, Optional, Callable
 
 def flatten_floats(
     data: Union[List[float], List[List[float]]]
@@ -84,9 +86,12 @@ def find_best_threshold(y_true, scores, n_thresholds=100):
 
     return float(best_thr), float(best_f1), float(best_acc)
 
-def compute_metrics(eval_pred: EvalPrediction,
-                    classifier_configs: dict,
-                    id2_head: dict) -> dict:
+def compute_metrics(
+    eval_pred: EvalPrediction,
+    classifier_configs: dict,
+    id2_head: dict,
+    train_centroid_getter: Optional[Callable[[], Dict[str, Dict[int, np.ndarray]]]] = None,
+) -> dict:
     """
     - eval_pred.predictions は dict で、
         * 各 head の 2文タスク出力: predictions[head] → shape (N,)
@@ -111,6 +116,7 @@ def compute_metrics(eval_pred: EvalPrediction,
     active_heads = [id2_head[i] for i in label_dict['active_heads']]
     metrics: dict = {}
     head_vectors: dict = {}
+    train_centroids = train_centroid_getter() if train_centroid_getter is not None else {}
     
      # 各ベクトルを取得して float 配列に変換
     origin_pair = np.asarray(preds["original"], dtype=float)
@@ -207,21 +213,43 @@ def compute_metrics(eval_pred: EvalPrediction,
                 continue
             mask = np.asarray(idx, dtype=bool)
             emb_subset = embeddings[mask]
-            label_subset = labels[mask].astype(int) if len(labels) else np.array([], dtype=int)
-            if emb_subset.shape[0] <= 1:
+            label_subset = labels[mask] if len(labels) else np.array([], dtype=int)
+            label_subset = np.asarray(label_subset)
+            if label_subset.ndim > 1:
+                label_subset = label_subset.reshape(label_subset.shape[0], -1)
+                if label_subset.shape[1] == 1:
+                    label_subset = label_subset[:, 0]
+                else:
+                    label_subset = label_subset.flatten()
+            label_subset = label_subset.astype(int, copy=False)
+            if emb_subset.shape[0] == 0:
                 continue
-            norms = np.linalg.norm(emb_subset, axis=1, keepdims=True)
-            norms = np.where(norms == 0, 1.0, norms)
-            normalized = emb_subset / norms
-            similarity = normalized @ normalized.T
-            np.fill_diagonal(similarity, -np.inf)
-            nn_indices = np.argmax(similarity, axis=1)
-            y_pred = label_subset[nn_indices]
+
+            head_centroids = (train_centroids or {}).get(head)
+            if not head_centroids:
+                continue
+
+            centroid_labels = np.array(list(head_centroids.keys()), dtype=int)
+            centroid_vectors = np.asarray([head_centroids[label] for label in centroid_labels], dtype=float)
+            if centroid_vectors.ndim != 2 or centroid_vectors.shape[0] == 0:
+                continue
+            if centroid_vectors.shape[1] != emb_subset.shape[1]:
+                continue
+
+            diff = emb_subset[:, None, :] - centroid_vectors[None, :, :]
+            distances = np.sum(diff * diff, axis=2)
+            nearest_idx = np.argmin(distances, axis=1)
+            y_pred = centroid_labels[nearest_idx]
+
             if label_subset.size > 0:
                 acc = accuracy_score(label_subset, y_pred)
-                f1 = f1_score(label_subset, y_pred, average="macro")
+                f1 = f1_score(label_subset, y_pred, average="macro", zero_division=0)
+                ami = adjusted_mutual_info_score(label_subset, y_pred)
+                v_measure = v_measure_score(label_subset, y_pred)
                 metrics[f"{head}_knn_accuracy"] = float(acc)
                 metrics[f"{head}_knn_macro_f1"] = float(f1)
+                metrics[f"{head}_cluster_ami"] = float(ami)
+                metrics[f"{head}_cluster_v_measure"] = float(v_measure)
 
         elif obj == "contrastive_logit":
             # 3文タスク: pos/neg を縦連結してベクトル化

@@ -58,6 +58,7 @@ class CustomTrainer(Trainer):
         tsne_save_dir: Optional[str] = None,
         corr_labels: Optional[Dict[str, Dict[str, float]]] = None,
         corr_weights: Optional[Dict[str, Dict[str, float]]] = None,
+        tsne_label_mappings: Optional[Dict[str, Dict[int, str]]] = None,
         **kwargs
     ):
         """
@@ -70,6 +71,9 @@ class CustomTrainer(Trainer):
         self._tsne_current_dataset = None
         self._last_eval_predictions: Optional[Any] = None
         self._last_eval_label_ids: Optional[Any] = None
+        self._cached_train_centroids: Optional[Dict[str, Dict[int, np.ndarray]]] = None
+        self._train_centroids_dirty: bool = True
+        self.tsne_label_mappings: Dict[str, Dict[int, str]] = tsne_label_mappings or {}
 
         # 損失関数リストを準備
         self.loss_fns = {}
@@ -92,6 +96,7 @@ class CustomTrainer(Trainer):
                     "neg_pairs": cfg.get("inbatch_negative_pairs", 64),
                 }
         self.head2idx = {head: i for i, head in enumerate(classifier_configs.keys())}
+        self.idx2head = {idx: head for head, idx in self.head2idx.items()}
         self.head_objectives: Dict[str, HeadObjective] = {}
         for name, cfg in classifier_configs.items():
             obj = cfg.get("objective")
@@ -179,6 +184,7 @@ class CustomTrainer(Trainer):
                 loss = objective.compute_single(self, sub_emb, sub_tgt)
                 if loss is not None:
                     total_loss = total_loss + loss
+                    print(f"Loss for head '{head}' (single total): {total_loss.item()}")
 
         outputs2: Dict[str, torch.Tensor] = {}
         if inputs2:
@@ -283,15 +289,13 @@ class CustomTrainer(Trainer):
             if head not in full_outputs:
                 # スコア・tensor shape=(bsz,)
                 full_outputs[head] = torch.full((bsz,), float("nan"), device=device)
-            
-            # for suffix in ("pos_similarity", "neg_similarity", "anchor_embedding", "positive_embedding", "negative_embedding"):
-            if cfg["objective"] == "regression" or cfg["objective"] == "binary_classification":
-                for suffix in ("pos_similarity", "neg_similarity"):
-                    key = f"{head}_{suffix}"
-                    # anchor_prob は (bsz, num_classes) の可能性があるので次元数だけでも合わせたいですが、
-                    # ここではシンプルに (bsz, ) or (bsz,1) で nan を入れておく
-                    if key not in full_outputs:
-                        full_outputs[key] = torch.full((bsz,), float("nan"), device=device)
+                    
+            for suffix in ("pos_similarity", "neg_similarity"):
+                key = f"{head}_{suffix}"
+                # anchor_prob は (bsz, num_classes) の可能性があるので次元数だけでも合わせたいですが、
+                # ここではシンプルに (bsz, ) or (bsz,1) で nan を入れておく
+                if key not in full_outputs:
+                    full_outputs[key] = torch.full((bsz,), float("nan"), device=device)
                     
             if cfg["objective"] == "contrastive_logit":
                 for suffix in ("anchor_prob", "positive_prob", "negative_prob"):
@@ -320,6 +324,12 @@ class CustomTrainer(Trainer):
             return total_loss
 
         return total_loss, full_outputs
+
+    def training_step(self, model, inputs, num_items_in_batch: Optional[int] = None):
+        print("Starting training step...")
+        output = super().training_step(model, inputs, num_items_in_batch)
+        self._train_centroids_dirty = True
+        return output
 
 
     def _compute_info_nce_loss(
@@ -374,6 +384,7 @@ class CustomTrainer(Trainer):
 
             log_prob = torch.log(numer.clamp_min(eps)) - torch.log(denom)
             loss = -(log_prob.squeeze(1)[valid]).mean()
+            print(f"infoNCE loss (full pairs): {loss.item()}")
             return loss
 
         # --- 上限付きサンプリング（互換用） ---
@@ -405,6 +416,7 @@ class CustomTrainer(Trainer):
         if not losses:
             return None
 
+        print(f"infoNCE loss (sampled pairs): {torch.stack(losses).mean().item()}")
         return torch.stack(losses).mean()
 
     def evaluation_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
@@ -477,6 +489,90 @@ class CustomTrainer(Trainer):
 
         return output
 
+    def get_train_label_centroids(self) -> Dict[str, Dict[int, np.ndarray]]:
+        if self.train_dataset is None:
+            return {}
+        if not self._train_centroids_dirty and self._cached_train_centroids is not None:
+            return self._cached_train_centroids
+        centroids = self._build_train_label_centroids()
+        self._cached_train_centroids = centroids
+        self._train_centroids_dirty = False
+        return centroids
+
+    def _build_train_label_centroids(self) -> Dict[str, Dict[int, np.ndarray]]:
+        dataset = self.train_dataset
+        if dataset is None:
+            return {}
+
+        dataloader = self.get_eval_dataloader(dataset)
+        model = self.model
+        was_training = model.training
+        model.eval()
+
+        head_sums: Dict[str, Dict[int, np.ndarray]] = defaultdict(dict)
+        head_counts: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+
+        with torch.no_grad():
+            for batch in dataloader:
+                inputs = self._prepare_inputs(batch)
+                _, outputs = self.compute_loss(model, inputs, return_outputs=True)
+                embeddings = outputs.get("embeddings")
+                if embeddings is None:
+                    continue
+                emb = embeddings.detach().cpu().numpy()
+                if emb.ndim != 2 or emb.shape[0] == 0:
+                    continue
+
+                labels_tensor = inputs.get("labels")
+                if labels_tensor is None:
+                    continue
+                labels_np = labels_tensor.detach().cpu().view(-1).numpy()
+
+                active_heads_field = inputs.get("active_heads", [])
+                head_list = flatten_strings(active_heads_field)
+                if len(head_list) < emb.shape[0]:
+                    head_list = head_list + [""] * (emb.shape[0] - len(head_list))
+                elif len(head_list) > emb.shape[0]:
+                    head_list = head_list[: emb.shape[0]]
+
+                valid_mask = np.isfinite(emb).all(axis=1)
+                for idx, is_valid in enumerate(valid_mask):
+                    if not is_valid:
+                        continue
+                    if idx >= len(labels_np):
+                        continue
+                    head_name = head_list[idx] if idx < len(head_list) else None
+                    if not head_name:
+                        continue
+                    cfg = self.classifier_configs.get(head_name)
+                    if not cfg or cfg.get("objective") != "infoNCE":
+                        continue
+                    label_value = labels_np[idx]
+                    if not np.isfinite(label_value):
+                        continue
+                    label_int = int(label_value)
+                    vector = emb[idx]
+                    sums_for_head = head_sums[head_name]
+                    if label_int in sums_for_head:
+                        sums_for_head[label_int] += vector
+                    else:
+                        sums_for_head[label_int] = vector.copy()
+                    head_counts[head_name][label_int] += 1
+
+        if was_training:
+            model.train()
+
+        centroids: Dict[str, Dict[int, np.ndarray]] = {}
+        for head_name, label_sums in head_sums.items():
+            centroids[head_name] = {}
+            for label_value, vector_sum in label_sums.items():
+                count = head_counts[head_name][label_value]
+                if count <= 0:
+                    continue
+                centroids[head_name][label_value] = (vector_sum / count).astype(np.float32)
+
+        return centroids
+
     def _to_numpy(self, value: Any) -> Optional[np.ndarray]:
         if value is None:
             return None
@@ -506,6 +602,49 @@ class CustomTrainer(Trainer):
             flat = flat[:target_len]
         return flat
 
+    def _extract_active_head_names(self, label_ids: Any, target_len: int) -> List[Optional[str]]:
+        if not isinstance(label_ids, dict):
+            return [None] * target_len
+        active = label_ids.get("active_heads")
+        arr = self._to_numpy(active)
+        if arr is None or arr.size == 0:
+            return [None] * target_len
+
+        flat = arr.reshape(-1)
+        names: List[Optional[str]] = []
+        for i in range(target_len):
+            if i < flat.shape[0]:
+                idx = int(flat[i])
+                names.append(self.idx2head.get(idx))
+            else:
+                names.append(None)
+        return names
+
+    def _format_tsne_label_name(self, label_value: Any, head_name: Optional[str]) -> str:
+        if label_value is None:
+            return "Unlabeled"
+        if isinstance(label_value, (float, np.floating)) and not np.isfinite(label_value):
+            return "Unlabeled"
+
+        label_int: Optional[int] = None
+        if isinstance(label_value, (int, np.integer)):
+            label_int = int(label_value)
+        elif isinstance(label_value, (float, np.floating)):
+            if np.isfinite(label_value) and float(label_value).is_integer():
+                label_int = int(round(float(label_value)))
+
+        if head_name and label_int is not None:
+            mapping = self.tsne_label_mappings.get(head_name)
+            if mapping:
+                label_name = mapping.get(label_int)
+                if label_name is not None:
+                    return label_name
+                return f"{head_name}:{label_int}"
+
+        if head_name:
+            return f"{head_name}:{label_value}"
+        return str(label_value)
+
     def _save_tsne_plot(self, metric_key_prefix: str) -> None:
         if not isinstance(self._last_eval_predictions, dict):
             return
@@ -518,6 +657,7 @@ class CustomTrainer(Trainer):
             return
 
         labels = self._extract_labels(self._last_eval_label_ids, emb_array.shape[0])
+        head_names = self._extract_active_head_names(self._last_eval_label_ids, emb_array.shape[0])
 
         perplexity = max(1, min(30, emb_array.shape[0] - 1))
         if emb_array.shape[0] <= 2:
@@ -534,17 +674,22 @@ class CustomTrainer(Trainer):
         os.makedirs(self.tsne_save_dir, exist_ok=True)
 
         fig, ax = plt.subplots(figsize=(8, 6))
-        unique_labels = np.unique(labels)
-        cmap = plt.cm.get_cmap("tab20", len(unique_labels) or 1)
+        display_labels = np.array(
+            [self._format_tsne_label_name(label, head)
+             for label, head in zip(labels, head_names)],
+            dtype=object,
+        )
+        unique_display = np.unique(display_labels)
+        cmap = plt.cm.get_cmap("tab20", len(unique_display) or 1)
 
-        for idx, label in enumerate(unique_labels):
-            mask = labels == label
+        for idx, label_name in enumerate(unique_display):
+            mask = display_labels == label_name
             ax.scatter(
                 points_2d[mask, 0],
                 points_2d[mask, 1],
                 s=15,
                 color=cmap(idx),
-                label=str(label),
+                label=str(label_name),
                 alpha=0.8,
                 edgecolors="none",
             )
@@ -552,7 +697,10 @@ class CustomTrainer(Trainer):
         ax.set_title("Evaluation Embeddings t-SNE")
         ax.set_xlabel("Component 1")
         ax.set_ylabel("Component 2")
-        ax.legend(loc="best", fontsize="small", title="Label")
+        legend_title = "Label"
+        if any(head is not None for head in head_names):
+            legend_title = "Emotion"
+        ax.legend(loc="best", fontsize="small", title=legend_title)
         ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
 
         step = self.state.global_step if self.state is not None else 0

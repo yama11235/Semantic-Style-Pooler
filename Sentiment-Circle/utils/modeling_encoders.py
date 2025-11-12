@@ -12,6 +12,7 @@ from modeling_config import (
 )
 import os
 from sentence_batch_utils import BatchPartitioner
+from contextlib import nullcontext
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s: %(message)s')
 
@@ -229,21 +230,23 @@ class Pooler(nn.Module):
     def forward(self, attention_mask, outputs, target_layer=-1):
         last_hidden = outputs.last_hidden_state
         hidden_states = outputs.hidden_states
+        dtype = last_hidden.dtype
+        print(f"dtype in Pooler: {dtype}")
 
         if self.pooler_type in ['cls_before_pooler', 'cls']:
             return last_hidden[:, 0]
         elif self.pooler_type == 'avg':
-            return ((hidden_states[target_layer] * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1))
+            return ((hidden_states[target_layer] * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)).to(dtype)
         elif self.pooler_type == 'avg_first_last':
             first_hidden = hidden_states[0]
             last_hidden = hidden_states[-1]
             pooled_result = ((first_hidden + last_hidden) / 2.0 * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
-            return pooled_result
+            return pooled_result.to(dtype)
         elif self.pooler_type == 'avg_top2':
             second_last_hidden = hidden_states[-2]
             last_hidden = hidden_states[-1]
             pooled_result = ((last_hidden + second_last_hidden) / 2.0 * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
-            return pooled_result
+            return pooled_result.to(dtype)
         elif self.pooler_type == 'last':
             # attention_mask の 1 の数から「最後の有効トークン位置」を計算
             # lengths: (batch_size,)  各サンプルの非パディング長
@@ -253,7 +256,7 @@ class Pooler(nn.Module):
             batch_idx = torch.arange(attention_mask.size(0), device=attention_mask.device)
             # hidden_states[target_layer]: (batch_size, seq_len, hidden_size)
             # [batch_idx, lengths] で (batch_size, hidden_size) が得られる
-            return hidden_states[target_layer][batch_idx, lengths]
+            return hidden_states[target_layer][batch_idx, lengths].to(dtype)
         else:
             raise NotImplementedError
   
@@ -282,7 +285,7 @@ class BiEncoderForClassification(PreTrainedModel):
                 revision=getattr(model_config, "model_revision", None),
                 use_auth_token=True if getattr(model_config, "use_auth_token", None) else None,
                 attn_implementation=getattr(model_config, "attn_implementation", "eager"),
-                torch_dtype=getattr(model_config, "torch_dtype", torch.float16),
+                add_pooling_layer=False,
             ).base_model.eval()  # 評価モードに設定
             
         else:
@@ -296,7 +299,7 @@ class BiEncoderForClassification(PreTrainedModel):
                 revision=getattr(model_config, "model_revision", None),
                 use_auth_token=True if getattr(model_config, "use_auth_token", None) else None,
                 attn_implementation=getattr(model_config, "attn_implementation", "eager"),
-                torch_dtype=getattr(model_config, "torch_dtype", torch.float16),
+                add_pooling_layer=False,
             ).base_model
             self.backbone.eval()  # 評価モードに設定
             
@@ -325,20 +328,20 @@ class BiEncoderForClassification(PreTrainedModel):
             "triplet": TripletSentencePath(self),
         }
         # 分類器をbackboneと同じdevice・dtypeに移動
-        # print(f"dtype: {next(self.backbone.parameters()).dtype}, device: {next(self.backbone.parameters()).device}")
+        print(f"dtype: {next(self.backbone.parameters()).dtype}, device: {next(self.backbone.parameters()).device}")
         for name, classifier in self.embedding_classifiers.items():
             classifier.to(device=next(self.backbone.parameters()).device, dtype=next(self.backbone.parameters()).dtype)
             # # ダミー入力（バッチサイズ1, 入力次元2560、backboneと同じdtype・deviceで作成）
-            # dummy_input = torch.randn(1, 2560, device=next(classifier.parameters()).device, dtype=next(classifier.parameters()).dtype)
+            dummy_input = torch.randn(1, 1024, device=next(classifier.parameters()).device, dtype=next(classifier.parameters()).dtype)
 
             # # 入力のdtype
-            # print("入力のdtype:", dummy_input.dtype)
+            print("入力のdtype:", dummy_input.dtype)
 
             # # 出力を得る
-            # output = classifier(dummy_input)
+            output = classifier(dummy_input)
 
             # # 出力のdtype
-            # print("出力のdtype:", output.dtype)
+            print("出力のdtype:", output.dtype)
 
         
     def forward(
@@ -401,6 +404,7 @@ class BiEncoderForClassification(PreTrainedModel):
                 if embeddings is None:
                     raise ValueError("encode() did not return 'original' embeddings for single-sentence input.")
                 outputs.setdefault("embeddings", embeddings)
+            print(f"dtype of outputs: { {k: v.dtype for k, v in outputs.items()} }")
             return outputs
 
         outputs_by_kind = {}
@@ -413,7 +417,6 @@ class BiEncoderForClassification(PreTrainedModel):
             outputs_by_kind[kind] = outputs
 
         return partitioner.merge(outputs_by_kind, device=device)
-
 
     # ── それぞれのパスで“本体”を切り出すヘルパー例 ──
     def _forward_binary(
@@ -433,8 +436,7 @@ class BiEncoderForClassification(PreTrainedModel):
         # print(f"input_ids shape: {input_ids.shape}, attention_mask shape: {attention_mask.shape}")
         # print(f"device: input_ids {input_ids.device}, attention_mask {attention_mask.device}")
         # print(f"device: backbone {self.backbone.device}")
-        with torch.no_grad():
-            outputs = self.backbone(
+        outputs = self.backbone(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
@@ -516,8 +518,7 @@ class BiEncoderForClassification(PreTrainedModel):
             """        
             Returns the embedding for single sentence.
             """
-            with torch.no_grad():
-                outputs = self.backbone(
+            outputs = self.backbone(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     token_type_ids=token_type_ids,
@@ -526,7 +527,7 @@ class BiEncoderForClassification(PreTrainedModel):
                 inputs_embeds=inputs_embeds,
                 output_hidden_states=self.output_hidden_states,
                 )
-            
+            print(f"dtype in encode: {outputs.last_hidden_state.dtype}")
             outputs_dict = {}
             if self.classifier_configs:
                 for name, classifier in self.embedding_classifiers.items():
@@ -553,8 +554,7 @@ class BiEncoderForClassification(PreTrainedModel):
             """        
             Returns the embedding for single sentence.
             """ 
-            with torch.no_grad():
-                outputs = self.backbone(
+            outputs = self.backbone(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     token_type_ids=token_type_ids,
@@ -613,8 +613,7 @@ class BiEncoderForClassification(PreTrainedModel):
         head_mask = concat_features(head_mask, head_mask_2, head_mask_3)
         inputs_embeds = concat_features(inputs_embeds, inputs_embeds_2, inputs_embeds_3)
 
-        with torch.no_grad():
-            outputs = self.backbone(
+        outputs = self.backbone(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,

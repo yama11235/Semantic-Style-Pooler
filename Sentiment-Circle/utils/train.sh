@@ -31,6 +31,7 @@ cat <<JSON >"${CONFIG_PATH}"
 {
   "sentiment": {
     "type": "linear",
+    "layer": -1,
     "objective": "infoNCE",
     "distance": "cosine",
     "output_dim": 256,
@@ -46,7 +47,7 @@ WANDB_PROJECT_NAME=${WANDB_PROJECT_NAME:-sentiment_info_nce}
 WANDB_PROJECT=${WANDB_PROJECT:-sentiment_circle}
 mkdir -p "${OUTPUT_DIR}/${WANDB_PROJECT}/${WANDB_PROJECT_NAME}"
 
-python "${SCRIPT_DIR}/train.py" \
+CUDA_VISIBLE_DEVICES=0 python "${SCRIPT_DIR}/train.py" \
   --model_name_or_path "${MODEL_NAME}" \
   --output_dir "${OUTPUT_DIR}" \
   --train_file "${DATA_DIR}/Train_df.csv" \
@@ -61,8 +62,7 @@ python "${SCRIPT_DIR}/train.py" \
   --gradient_accumulation_steps ${GRAD_ACCUM} \
   --learning_rate ${LEARNING_RATE} \
   --num_train_epochs ${NUM_EPOCHS} \
-  --warmup_ratio 0.1 \
-  --lr_scheduler_type linear \
+  --lr_scheduler_type constant \
   --logging_steps 50 \
   --eval_steps 50 \
   --eval_strategy steps \

@@ -35,7 +35,7 @@ from functools import partial
 import wandb
 import torch
 from datasets import concatenate_datasets, DatasetDict
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Dict
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s: %(message)s"
@@ -301,6 +301,8 @@ def main():
         filemode="a",
     )
     training_args.log_level = "info"
+    # Keep custom columns (e.g., active_heads) for the data collator.
+    training_args.remove_unused_columns = False
     log_level = training_args.get_process_log_level()
     logger.setLevel(log_level)
     datasets.utils.logging.set_verbosity(log_level)
@@ -492,6 +494,16 @@ def main():
     elif training_args.bf16:
         config.torch_dtype = torch.bfloat16
     model_cls = get_model(model_args)
+    if model_args.classifier_configs is not None:
+        if os.path.exists(model_args.classifier_configs):
+            classifier_configs = json.load(open(model_args.classifier_configs))
+        else:
+            classifier_configs = parse_dict(model_args.classifier_configs)
+        aspect_key = list(classifier_configs.keys())
+    else:
+        classifier_configs = None
+        aspect_key = model_args.aspect_key
+
     config.update(
         {
             "freeze_encoder": model_args.freeze_encoder,
@@ -505,16 +517,6 @@ def main():
             "device_map": model_args.device_map,
         }
     )
-    if model_args.classifier_configs is not None:
-        if os.path.exists(model_args.classifier_configs):
-            classifier_configs = json.load(open(model_args.classifier_configs))
-        else:
-            classifier_configs = parse_dict(model_args.classifier_configs)
-        aspect_key = list(classifier_configs.keys())
-    else:
-        classifier_configs = None
-        aspect_key = model_args.aspect_key
-
     if aspect_key is None:
         aspect_key = []
     elif isinstance(aspect_key, str):
@@ -539,6 +541,8 @@ def main():
                 )
         raw_datasets[split] = dataset
 
+    label_name_mappings: Dict[str, Dict[int, str]] = {}
+
     for head in aspect_key:
         sample_values = []
         for dataset in raw_datasets.values():
@@ -552,6 +556,7 @@ def main():
         if isinstance(sample_values[0], str):
             unique_values = sorted({v for ds in raw_datasets.values() if head in ds.column_names for v in ds[head]})
             label_to_id_map = {label: idx for idx, label in enumerate(unique_values)}
+            label_name_mappings[head] = {idx: label for label, idx in label_to_id_map.items()}
 
             def _encode_labels(example):
                 value = example.get(head)
@@ -595,7 +600,8 @@ def main():
     else:
         for param in model.backbone.parameters():
             param.requires_grad = True
-    
+
+    print(f"model architecture: {model}")
     # Padding strategy
     if data_args.pad_to_max_length:
         padding = "longest"
@@ -685,8 +691,9 @@ def main():
             logger.info(f"tokens: {tokenizer.decode(input_ids)}")
             logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
-    collator_dtype = getattr(config, "torch_dtype", None) or torch.float32
+    collator_dtype = getattr(config, "torch_dtype", torch.float16)
 
+    print(f"torch dtype: {config.torch_dtype}, collator_dtype: {collator_dtype}")
     data_collator = DataCollatorForBiEncoder(
         tokenizer=tokenizer,
         padding="max_length",
@@ -715,10 +722,19 @@ def main():
             name=wandb_project_name,
         )
         
+    centroid_state = {"trainer": None}
+
+    def train_centroid_getter():
+        trainer_obj = centroid_state["trainer"]
+        if trainer_obj is None:
+            return {}
+        return trainer_obj.get_train_label_centroids()
+
     compute_fn = partial(
         compute_metrics,
         classifier_configs=classifier_configs_for_trainer,
         id2_head=id2_head,
+        train_centroid_getter=train_centroid_getter,
     )
     
     trainer = CustomTrainer(
@@ -735,7 +751,9 @@ def main():
         corr_labels=corr_labels,
         corr_weights=corr_weights,
         tsne_save_dir=os.path.join(training_args.output_dir, "tsne_plots"),
+        tsne_label_mappings=label_name_mappings,
     )
+    centroid_state["trainer"] = trainer
     
     trainer.remove_callback(PrinterCallback)
     trainer.add_callback(LogCallback)
