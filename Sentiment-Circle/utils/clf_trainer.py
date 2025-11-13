@@ -11,7 +11,7 @@ from datasets import Dataset
 from sklearn.manifold import TSNE
 from transformers import Trainer
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict
 from sentence_batch_utils import (
     BatchPartitioner,
@@ -153,128 +153,28 @@ class CustomTrainer(Trainer):
         inputs3 = partitioner.slice(inputs, "triplet", device)
 
         active_heads = extract_unique_strings(inputs["active_heads"])
-        labels1 = inputs1.get("labels") if inputs1 else None
-        labels2 = inputs2.get("labels") if inputs2 else None
-        labels3 = inputs3.get("labels") if inputs3 else None
 
         total_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
-        outputs1: Dict[str, torch.Tensor] = {}
-        if inputs1:
-            outputs1 = model(**inputs1)
-            for head in active_heads:
-                objective = self.head_objectives.get(head)
-                if objective is None:
-                    continue
-                head_output = outputs1.get(head)
-                if head_output is None:
-                    continue
-                mask = self._head_mask(inputs1.get("active_heads"), head, device)
-                if mask is None or mask.sum() == 0:
-                    continue
-                if labels1 is None:
-                    continue
-                sub_emb = head_output[mask]
-                sub_tgt = labels1[mask].flatten()
-                valid = self._finite_mask(sub_tgt)
-                if valid.sum() == 0:
-                    continue
-                sub_emb = sub_emb[valid]
-                sub_tgt = sub_tgt[valid]
-                if sub_emb.size(0) < 2:
-                    continue
-                loss = objective.compute_single(self, sub_emb, sub_tgt)
-                if loss is not None:
-                    total_loss = total_loss + loss
-                    # print(f"Loss for head '{head}' (single total): {total_loss.item()}")
-                    # print(f"loss dtype : {loss.dtype}, total_loss dtype: {total_loss.dtype}")
+        single_loss, outputs1 = self._compute_single_loss(model, inputs1, active_heads, device)
+        if single_loss is not None:
+            total_loss = total_loss + single_loss
 
-        outputs2: Dict[str, torch.Tensor] = {}
-        if inputs2:
-            outputs2 = model(**inputs2)
-            for head in active_heads:
-                objective = self.head_objectives.get(head)
-                if objective is None:
-                    continue
-                tensor = outputs2.get(head)
-                if tensor is None:
-                    continue
-                mask = self._head_mask(inputs2.get("active_heads"), head, device)
-                if mask is None or mask.sum() == 0:
-                    continue
-                if labels2 is None:
-                    continue
-                sub_out = tensor[mask]
-                sub_tgt = labels2[mask].flatten()
-                valid = self._finite_mask(sub_tgt)
-                if valid.sum() == 0:
-                    continue
-                sub_out = sub_out[valid]
-                sub_tgt = sub_tgt[valid]
-                loss = objective.compute_pair(sub_out, sub_tgt)
-                if loss is not None:
-                    total_loss = total_loss + loss
+        pair_loss, outputs2 = self._compute_pair_loss(model, inputs2, active_heads, device)
+        if pair_loss is not None:
+            total_loss = total_loss + pair_loss
 
-            for hi, row in self.corr_labels.items():
-                for hj, target_corr in row.items():
-                    if hi not in outputs2 or hj not in outputs2:
-                        continue
-                    oi = outputs2[hi]
-                    oj = outputs2[hj]
-                    xi = oi.float()
-                    xj = oj.float()
-                    if xi.numel() > 1 and xj.numel() > 1:
-                        corrmat = torch.corrcoef(torch.stack([xi, xj], dim=0))
-                        rho = corrmat[0, 1]
-                        weights = self.corr_weights.get(hi, {}).get(hj, 1.0)
-                        tgt = torch.tensor(target_corr, device=device, dtype=rho.dtype)
-                        total_loss = total_loss + weights * F.mse_loss(rho, tgt)
+        pair_corr_penalty = self._compute_pair_correlation_penalty(outputs2, device)
+        if pair_corr_penalty is not None:
+            total_loss = total_loss + pair_corr_penalty
 
-        outputs3: Dict[str, torch.Tensor] = {}
-        if inputs3:
-            outputs3 = model(**inputs3)
-            for head in active_heads:
-                objective = self.head_objectives.get(head)
-                if objective is None:
-                    continue
-                mask = self._head_mask(inputs3.get("active_heads"), head, device)
-                if mask is None or mask.sum() == 0:
-                    continue
-                if labels3 is None:
-                    continue
-                subset_labels = labels3[mask].flatten()
-                valid = self._finite_mask(subset_labels)
-                if valid.sum() == 0:
-                    continue
-                refined_mask = mask.clone()
-                refined_mask[mask] = valid
-                loss = objective.compute_triplet(
-                    self,
-                    outputs3,
-                    refined_mask,
-                    subset_labels[valid],
-                )
-                if loss is not None:
-                    total_loss = total_loss + loss
+        triplet_loss, outputs3 = self._compute_triplet_loss(model, inputs3, active_heads, device)
+        if triplet_loss is not None:
+            total_loss = total_loss + triplet_loss
 
-            for hi, row in self.corr_labels.items():
-                for hj, tgt_corr in row.items():
-                    pos_i = outputs3.get(f"{hi}_pos_similarity")
-                    neg_i = outputs3.get(f"{hi}_neg_similarity")
-                    pos_j = outputs3.get(f"{hj}_pos_similarity")
-                    neg_j = outputs3.get(f"{hj}_neg_similarity")
-                    if pos_i is None or neg_i is None or pos_j is None or neg_j is None:
-                        continue
-                    vi = torch.cat([pos_i, neg_i], dim=0)
-                    vj = torch.cat([pos_j, neg_j], dim=0)
-                    xi = vi.float()
-                    xj = vj.float()
-                    if xi.numel() > 1 and xj.numel() > 1:
-                        corrmat = torch.corrcoef(torch.stack([xi, xj], dim=0))
-                        rho = corrmat[0, 1]
-                        weights = self.corr_weights.get(hi, {}).get(hj, 1.0)
-                        tgt = torch.tensor(tgt_corr, device=device, dtype=rho.dtype)
-                        total_loss = total_loss + weights * F.mse_loss(rho, tgt)
+        triplet_corr_penalty = self._compute_triplet_correlation_penalty(outputs3, device)
+        if triplet_corr_penalty is not None:
+            total_loss = total_loss + triplet_corr_penalty
 
         full_outputs = partitioner.merge(
             {
@@ -284,49 +184,247 @@ class CustomTrainer(Trainer):
             },
             device=device,
         )
-        
-        # 5) 欠けているキーをすべて埋める
-        #    regression/binary head は key = head
-        #    contrastive head は pos/neg/anchor_prob の３つ
-        for head, cfg in self.classifier_configs.items():
-            if head not in full_outputs:
-                # スコア・tensor shape=(bsz,)
-                full_outputs[head] = torch.full((bsz,), float("nan"), device=device)
-                    
-            for suffix in ("pos_similarity", "neg_similarity"):
-                key = f"{head}_{suffix}"
-                # anchor_prob は (bsz, num_classes) の可能性があるので次元数だけでも合わせたいですが、
-                # ここではシンプルに (bsz, ) or (bsz,1) で nan を入れておく
-                if key not in full_outputs:
-                    full_outputs[key] = torch.full((bsz,), float("nan"), device=device)
-                    
-            if cfg["objective"] == "contrastive_logit":
-                for suffix in ("anchor_prob", "positive_prob", "negative_prob"):
-                    key = f"{head}_{suffix}"
-                    if key not in full_outputs:
-                        nclass = cfg.get("output_dim", None)
-                        if nclass is None:
-                            raise ValueError(f"Missing num_labels in config for {head}")
-                        shape = (bsz, nclass)
 
-                        full_outputs[key] = torch.full(
-                            shape,
-                            float("nan"),
-                            dtype=torch.float32,
-                            device=device
-                        )
-            # for suffix in ("_pos_similarity", "_neg_similarity", "_anchor_embedding", "_positive_embedding", "_negative_embedding", ""):
-            for suffix in ("_pos_similarity", "_neg_similarity", ""):
-                key = f"original{suffix}"
-                # anchor_prob は (bsz, num_classes) の可能性があるので次元数だけでも合わせたいですが、
-                # ここではシンプルに (bsz, ) or (bsz,1) で nan を入れておく
-                if key not in full_outputs:
-                    full_outputs[key] = torch.full((bsz,), float("nan"), device=device)
-        
+        self._fill_missing_output_keys(full_outputs, bsz, device)
+
         if not return_outputs:
             return total_loss
 
         return total_loss, full_outputs
+
+    def _compute_single_loss(
+        self,
+        model,
+        inputs: Optional[Dict[str, Any]],
+        active_heads: List[str],
+        device: torch.device,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        if not inputs:
+            return None, {}
+
+        outputs = model(**inputs)
+        loss: Optional[torch.Tensor] = None
+        labels = inputs.get("labels")
+        batch_active_heads = inputs.get("active_heads")
+
+        for head in active_heads:
+            objective = self.head_objectives.get(head)
+            if objective is None:
+                continue
+            head_output = outputs.get(head)
+            if head_output is None:
+                continue
+
+            prepared = self._prepare_head_batch(batch_active_heads, head, labels, device)
+            if prepared is None:
+                continue
+            mask, valid, subset_labels = prepared
+
+            filtered_embeddings = head_output[mask]
+            filtered_embeddings = filtered_embeddings[valid]
+            if filtered_embeddings.size(0) < 2:
+                continue
+
+            filtered_labels = subset_labels[valid]
+            head_loss = objective.compute_single(self, filtered_embeddings, filtered_labels)
+            loss = self._accumulate_loss(loss, head_loss)
+
+        return loss, outputs
+
+    def _compute_pair_loss(
+        self,
+        model,
+        inputs: Optional[Dict[str, Any]],
+        active_heads: List[str],
+        device: torch.device,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        if not inputs:
+            return None, {}
+
+        outputs = model(**inputs)
+        loss: Optional[torch.Tensor] = None
+        labels = inputs.get("labels")
+        batch_active_heads = inputs.get("active_heads")
+
+        for head in active_heads:
+            objective = self.head_objectives.get(head)
+            if objective is None:
+                continue
+            tensor = outputs.get(head)
+            if tensor is None:
+                continue
+
+            prepared = self._prepare_head_batch(batch_active_heads, head, labels, device)
+            if prepared is None:
+                continue
+            mask, valid, subset_labels = prepared
+
+            filtered_output = tensor[mask]
+            filtered_output = filtered_output[valid]
+            filtered_labels = subset_labels[valid]
+            head_loss = objective.compute_pair(filtered_output, filtered_labels)
+            loss = self._accumulate_loss(loss, head_loss)
+
+        return loss, outputs
+
+    def _compute_triplet_loss(
+        self,
+        model,
+        inputs: Optional[Dict[str, Any]],
+        active_heads: List[str],
+        device: torch.device,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        if not inputs:
+            return None, {}
+
+        outputs = model(**inputs)
+        loss: Optional[torch.Tensor] = None
+        labels = inputs.get("labels")
+        batch_active_heads = inputs.get("active_heads")
+
+        for head in active_heads:
+            objective = self.head_objectives.get(head)
+            if objective is None:
+                continue
+
+            prepared = self._prepare_head_batch(batch_active_heads, head, labels, device)
+            if prepared is None:
+                continue
+            mask, valid, subset_labels = prepared
+
+            refined_mask = self._apply_valid_to_mask(mask, valid)
+            filtered_labels = subset_labels[valid]
+            head_loss = objective.compute_triplet(self, outputs, refined_mask, filtered_labels)
+            loss = self._accumulate_loss(loss, head_loss)
+
+        return loss, outputs
+
+    def _compute_pair_correlation_penalty(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if not outputs:
+            return None
+
+        penalty: Optional[torch.Tensor] = None
+        for hi, row in self.corr_labels.items():
+            for hj, target_corr in row.items():
+                if hi not in outputs or hj not in outputs:
+                    continue
+                xi = outputs[hi].float()
+                xj = outputs[hj].float()
+                if xi.numel() <= 1 or xj.numel() <= 1:
+                    continue
+                corrmat = torch.corrcoef(torch.stack([xi, xj], dim=0))
+                rho = corrmat[0, 1]
+                weights = self.corr_weights.get(hi, {}).get(hj, 1.0)
+                tgt = torch.tensor(target_corr, device=device, dtype=rho.dtype)
+                penalty = self._accumulate_loss(penalty, weights * F.mse_loss(rho, tgt))
+
+        return penalty
+
+    def _compute_triplet_correlation_penalty(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if not outputs:
+            return None
+
+        penalty: Optional[torch.Tensor] = None
+        for hi, row in self.corr_labels.items():
+            for hj, target_corr in row.items():
+                pos_i = outputs.get(f"{hi}_pos_similarity")
+                neg_i = outputs.get(f"{hi}_neg_similarity")
+                pos_j = outputs.get(f"{hj}_pos_similarity")
+                neg_j = outputs.get(f"{hj}_neg_similarity")
+                if pos_i is None or neg_i is None or pos_j is None or neg_j is None:
+                    continue
+                vi = torch.cat([pos_i, neg_i], dim=0).float()
+                vj = torch.cat([pos_j, neg_j], dim=0).float()
+                if vi.numel() <= 1 or vj.numel() <= 1:
+                    continue
+                corrmat = torch.corrcoef(torch.stack([vi, vj], dim=0))
+                rho = corrmat[0, 1]
+                weights = self.corr_weights.get(hi, {}).get(hj, 1.0)
+                tgt = torch.tensor(target_corr, device=device, dtype=rho.dtype)
+                penalty = self._accumulate_loss(penalty, weights * F.mse_loss(rho, tgt))
+
+        return penalty
+
+    def _fill_missing_output_keys(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+    ) -> None:
+        for head, cfg in self.classifier_configs.items():
+            if head not in outputs:
+                outputs[head] = torch.full((batch_size,), float("nan"), device=device)
+
+            for suffix in ("pos_similarity", "neg_similarity"):
+                key = f"{head}_{suffix}"
+                if key not in outputs:
+                    outputs[key] = torch.full((batch_size,), float("nan"), device=device)
+
+            if cfg["objective"] == "contrastive_logit":
+                for suffix in ("anchor_prob", "positive_prob", "negative_prob"):
+                    key = f"{head}_{suffix}"
+                    if key not in outputs:
+                        nclass = cfg.get("output_dim", None)
+                        if nclass is None:
+                            raise ValueError(f"Missing num_labels in config for {head}")
+                        shape = (batch_size, nclass)
+                        outputs[key] = torch.full(
+                            shape,
+                            float("nan"),
+                            dtype=torch.float32,
+                            device=device,
+                        )
+
+            for suffix in ("_pos_similarity", "_neg_similarity", ""):
+                key = f"original{suffix}"
+                if key not in outputs:
+                    outputs[key] = torch.full((batch_size,), float("nan"), device=device)
+
+    def _prepare_head_batch(
+        self,
+        batch_active_heads: Any,
+        head: str,
+        labels: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if labels is None:
+            return None
+
+        mask = self._head_mask(batch_active_heads, head, device)
+        if mask is None or mask.sum() == 0:
+            return None
+
+        subset_labels = labels[mask].flatten()
+        valid = self._finite_mask(subset_labels)
+        if valid.sum() == 0:
+            return None
+
+        return mask, valid, subset_labels
+
+    @staticmethod
+    def _apply_valid_to_mask(mask: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        refined_mask = mask.clone()
+        refined_mask[mask] = valid
+        return refined_mask
+
+    @staticmethod
+    def _accumulate_loss(
+        current: Optional[torch.Tensor],
+        new_loss: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if new_loss is None:
+            return current
+        if current is None:
+            return new_loss
+        return current + new_loss
 
     def training_step(self, model, inputs, num_items_in_batch: Optional[int] = None):
         # print("Starting training step...")
