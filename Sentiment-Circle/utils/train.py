@@ -34,7 +34,7 @@ from metrics import compute_metrics
 import wandb
 import torch
 from datasets import concatenate_datasets, DatasetDict
-from typing import List, Union, Optional, Dict
+from typing import List, Union, Optional, Dict, Tuple
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s: %(message)s"
@@ -282,6 +282,269 @@ class ModelArguments:
         },
     )
     
+def load_raw_datasets(
+    model_args: "ModelArguments",
+    data_args: "DataTrainingArguments",
+    training_args: TrainingArguments,
+    seed: int,
+) -> Tuple[DatasetDict, bool]:
+    data_files: Dict[str, List[str]] = {}
+
+    if training_args.do_train and data_args.train_file:
+        data_files["train"] = data_args.train_file
+        logger.info("Load train files: %s", data_args.train_file)
+    if data_args.validation_file:
+        data_files["validation"] = data_args.validation_file
+        logger.info("Load validation files: %s", data_args.validation_file)
+    if data_args.test_file:
+        data_files["test"] = data_args.test_file
+        logger.info("Load test files: %s", data_args.test_file)
+    elif training_args.do_predict:
+        raise ValueError("test_file argument is missing. required for do_predict.")
+
+    example_file = next((files[0] for files in data_files.values() if files), None)
+    if example_file is None:
+        raise ValueError(
+            "At least one of `train_file`, `validation_file`, or `test_file` must be provided."
+        )
+
+    file_type = "csv" if example_file.endswith(".csv") else "json"
+    logger.debug("Resolved file type for datasets: %s", file_type)
+
+    raw_datasets: Dict[str, datasets.Dataset] = {}
+
+    for split in ["train", "validation", "test"]:
+        paths = data_files.get(split, [])
+        if not paths:
+            continue
+
+        if split == "train":
+            sample_limit = data_args.max_train_samples
+        elif split == "validation":
+            sample_limit = data_args.max_eval_samples
+        else:
+            sample_limit = data_args.max_predict_samples
+
+        first = load_dataset(
+            file_type,
+            data_files={split: [paths[0]]},
+            split=split,
+            cache_dir=model_args.cache_dir,
+        )
+
+        if sample_limit is not None and len(first) > sample_limit:
+            first = first.shuffle(seed=seed).select(range(sample_limit))
+
+        datasets_to_concat = [first]
+        for path in paths[1:]:
+            dataset = load_dataset(
+                file_type,
+                data_files={split: [path]},
+                split=split,
+                cache_dir=model_args.cache_dir,
+            )
+            if sample_limit is not None and len(dataset) > sample_limit:
+                dataset = dataset.shuffle(seed=seed).select(range(sample_limit))
+
+            datasets_to_concat.append(dataset)
+
+        raw_datasets[split] = concatenate_datasets(datasets_to_concat).shuffle(
+            seed=training_args.seed
+        )
+
+    dataset_dict = DatasetDict(raw_datasets)
+
+    for split in dataset_dict.keys():
+        dataset_dict[split] = dataset_dict[split].shuffle(seed=seed)
+
+    for split, dataset in dataset_dict.items():
+        column_names = dataset.column_names
+        if "sentence1" not in column_names:
+            text_column = next(
+                (candidate for candidate in ["text", "sentence", "document", "utterance"] if candidate in column_names),
+                None,
+            )
+            if text_column is None:
+                raise ValueError(
+                    "Dataset must include a text column named 'sentence1' or one of "
+                    "['text', 'sentence', 'document', 'utterance']."
+                )
+            dataset = dataset.rename_column(text_column, "sentence1")
+        dataset_dict[split] = dataset
+
+    sentence3_flag = any(
+        "sentence3" in dataset.column_names for dataset in dataset_dict.values()
+    )
+
+    return dataset_dict, sentence3_flag
+
+
+def prepare_label_mappings(
+    raw_datasets: DatasetDict,
+    model_args: "ModelArguments",
+    data_args: "DataTrainingArguments",
+) -> Tuple[
+    DatasetDict,
+    List[str],
+    Dict[int, str],
+    Dict[str, int],
+    List[str],
+    Optional[Dict],
+    Dict[str, Dict],
+    Dict,
+    Dict,
+    Dict[str, Dict[int, str]],
+]:
+    if "validation" not in raw_datasets:
+        raise ValueError("--do_eval requires a validation dataset")
+
+    labels = [
+        key
+        for key in raw_datasets["validation"].features.keys()
+        if key not in {"sentence1", "sentence2", "sentence3"}
+    ]
+
+    id2label = {i: aspect for i, aspect in enumerate(list(labels))}
+    label2id = {aspect: i for i, aspect in enumerate(list(labels))}
+
+    if model_args.classifier_configs is not None:
+        if os.path.exists(model_args.classifier_configs):
+            classifier_configs = json.load(open(model_args.classifier_configs))
+        else:
+            classifier_configs = parse_dict(model_args.classifier_configs)
+        aspect_key = list(classifier_configs.keys())
+    else:
+        classifier_configs = None
+        aspect_key = model_args.aspect_key
+
+    if aspect_key is None:
+        aspect_key = []
+    elif isinstance(aspect_key, str):
+        aspect_key = [aspect_key]
+    else:
+        aspect_key = list(aspect_key)
+
+    label_candidates = ["labels", "label", "target"]
+    updated_datasets = raw_datasets
+    for split, dataset in updated_datasets.items():
+        for head in aspect_key:
+            if head in dataset.column_names:
+                continue
+            renamed = False
+            for candidate in label_candidates:
+                if candidate in dataset.column_names:
+                    dataset = dataset.rename_column(candidate, head)
+                    renamed = True
+                    break
+            if not renamed:
+                raise ValueError(
+                    f"Expected label column for head '{head}' not found in dataset columns: {dataset.column_names}"
+                )
+        updated_datasets[split] = dataset
+
+    label_name_mappings: Dict[str, Dict[int, str]] = {}
+
+    for head in aspect_key:
+        sample_values: List = []
+        for dataset in updated_datasets.values():
+            if head in dataset.column_names:
+                values = [v for v in dataset[head] if v is not None]
+                if values:
+                    sample_values.extend(values)
+                    break
+        if not sample_values:
+            continue
+        if isinstance(sample_values[0], str):
+            unique_values = sorted(
+                {
+                    v
+                    for ds in updated_datasets.values()
+                    if head in ds.column_names
+                    for v in ds[head]
+                }
+            )
+            label_to_id_map = {label: idx for idx, label in enumerate(unique_values)}
+            label_name_mappings[head] = {
+                idx: label for label, idx in label_to_id_map.items()
+            }
+
+            def _encode_labels(example):
+                value = example.get(head)
+                if value is not None and value in label_to_id_map:
+                    example[head] = label_to_id_map[value]
+                return example
+
+            updated_datasets = updated_datasets.map(
+                _encode_labels,
+                desc=f"Encoding labels for {head}",
+                load_from_cache_file=not data_args.overwrite_cache,
+            )
+
+    if model_args.corr_labels is not None:
+        if os.path.exists(model_args.corr_labels):
+            corr_labels = json.load(open(model_args.corr_labels))
+        else:
+            corr_labels = parse_dict(model_args.corr_labels)
+    else:
+        corr_labels = {}
+    if model_args.corr_weights is not None:
+        if os.path.exists(model_args.corr_weights):
+            corr_weights = json.load(open(model_args.corr_weights))
+        else:
+            corr_weights = parse_dict(model_args.corr_weights)
+    else:
+        corr_weights = {}
+
+    classifier_configs_for_trainer = (
+        classifier_configs
+        if classifier_configs is not None
+        else {head: {"objective": model_args.objective} for head in aspect_key}
+    )
+
+    return (
+        updated_datasets,
+        labels,
+        id2label,
+        label2id,
+        aspect_key,
+        classifier_configs,
+        classifier_configs_for_trainer,
+        corr_labels,
+        corr_weights,
+        label_name_mappings,
+    )
+
+
+def initialize_wandb(
+    model_args: "ModelArguments",
+    training_args: TrainingArguments,
+    classifier_configs: Optional[Dict],
+    max_train_samples: Optional[int],
+):
+    wandb_project = training_args.wandb_project.replace("_train.csv", "").replace(
+        "data_preprocessed/", ""
+    )
+    wandb_project_name = training_args.wandb_project_name
+    model_id = model_args.model_name_or_path.split("/")[-1]
+    sample_suffix = str(max_train_samples) if max_train_samples is not None else "all"
+
+    if model_args.freeze_encoder:
+        project_name = f"{model_id}_{sample_suffix}_{wandb_project}"
+        return wandb.init(
+            project=project_name,
+            entity="2959648335-university-of-tokyo",
+            name=wandb_project_name,
+            config=classifier_configs,
+        )
+
+    project_name = f"{model_id}-Hot_{sample_suffix}_{wandb_project}"
+    return wandb.init(
+        project=project_name,
+        entity="2959648335-university-of-tokyo",
+        name=wandb_project_name,
+    )
+
+
 def main():
     parser = HfArgumentParser(
         (ModelArguments, DataTrainingArguments, TrainingArguments)
@@ -336,114 +599,12 @@ def main():
     seed = training_args.seed
     random.seed(seed)
     
-    # ファイル種別確認
-    example_file = None
-    for file_list in (
-        data_args.train_file,
-        data_args.validation_file,
-        data_args.test_file,
-    ):
-        if file_list:
-            example_file = file_list[0]
-            break
-    if example_file is None:
-        raise ValueError(
-            "At least one of `train_file`, `validation_file`, or `test_file` must be provided."
-        )
-
-    file_type = "csv" if example_file.endswith(".csv") else "json"
-
-    # ロード対象ファイルをログ出力
-    if training_args.do_train:
-        logger.info(f"Load train files: {data_args.train_file}")
-    if data_args.validation_file is not None:
-        logger.info(f"Load validation files: {data_args.validation_file}")
-    if data_args.test_file is not None:
-        logger.info(f"Load test files: {data_args.test_file}")
-    elif training_args.do_predict:
-        raise ValueError("test_file argument is missing. required for do_predict.")
-
-    # load_dataset に data_files を渡すと DatasetDict が返ります
-    data_files = {}
-    if training_args.do_train and data_args.train_file:
-        data_files["train"] = data_args.train_file
-    if data_args.validation_file:
-        data_files["validation"] = data_args.validation_file
-    if data_args.test_file:
-        data_files["test"] = data_args.test_file
-
-    print(f"data_files: {data_files}")
-    print(f"train data: {data_files.get('train', None)}")
-
-    raw_datasets = {}
-
-    for split in ["train", "validation", "test"]:
-        paths = data_files.get(split, [])
-        if not paths:
-            continue
-
-        # Determine sampling limit per split
-        if split == "train":
-            sample_limit = data_args.max_train_samples
-        elif split == "validation":
-            sample_limit = data_args.max_eval_samples
-        else:
-            sample_limit = data_args.max_predict_samples
-
-        # 1) 最初のファイルをロードしてベースの Dataset とする
-        first = load_dataset(
-            file_type,
-            data_files={split: [paths[0]]},
-            split=split,
-            cache_dir=model_args.cache_dir,
-        )
-
-        if sample_limit is not None and len(first) > sample_limit:
-            first = first.shuffle(seed=seed).select(range(sample_limit))
-
-        ds_list = [first]
-
-        # 2) 2つ目以降はリストに追加
-        for path in paths[1:]:
-            ds = load_dataset(
-                file_type,
-                data_files={split: [path]},
-                split=split,
-                cache_dir=model_args.cache_dir,
-            )
-            if sample_limit is not None and len(ds) > sample_limit:
-                ds = ds.shuffle(seed=seed).select(range(sample_limit))
-
-            ds_list.append(ds)
-
-        # 3) まとめて連結
-        raw_datasets[split] = concatenate_datasets(ds_list).shuffle(seed=training_args.seed)
-    
-    raw_datasets = DatasetDict(raw_datasets)
-    
-    # 全 split を一気に shuffle
-    for split in raw_datasets.keys():
-        raw_datasets[split] = raw_datasets[split].shuffle(seed=seed)
-    
-    # Ensure text column exists under sentence1
-    for split, dataset in raw_datasets.items():
-        column_names = dataset.column_names
-        if "sentence1" not in column_names:
-            # Try to find a reasonable default text column
-            text_column = None
-            for candidate in ["text", "sentence", "document", "utterance"]:
-                if candidate in column_names:
-                    text_column = candidate
-                    break
-            if text_column is None:
-                raise ValueError(
-                    "Dataset must include a text column named 'sentence1' or one of "
-                    "['text', 'sentence', 'document', 'utterance']."
-                )
-            dataset = dataset.rename_column(text_column, "sentence1")
-        raw_datasets[split] = dataset
-
-    sentence3_flag = any("sentence3" in dataset.column_names for dataset in raw_datasets.values())
+    raw_datasets, sentence3_flag = load_raw_datasets(
+        model_args=model_args,
+        data_args=data_args,
+        training_args=training_args,
+        seed=seed,
+    )
     # if data_args.min_similarity is None:
     #     data_args.min_similarity = min(labels)
     #     logger.warning(
@@ -455,17 +616,22 @@ def main():
     #         f"Setting max_similarity: {data_args.max_similarity}. Override by setting --max_similarity."
     #     )        
 
-    labels = []
-    for key in raw_datasets["validation"].features.keys():
-        labels.append(key)
-    labels.remove("sentence1")
-    if "sentence2" in labels:
-        labels.remove("sentence2")
-    if "sentence3" in labels:
-        labels.remove("sentence3")
-
-    id2label = {i: aspect for i, aspect in enumerate(list(labels))}
-    label2id = {aspect: i for i, aspect in enumerate(list(labels))}
+    (
+        raw_datasets,
+        labels,
+        id2label,
+        label2id,
+        aspect_key,
+        classifier_configs,
+        classifier_configs_for_trainer,
+        corr_labels,
+        corr_weights,
+        label_name_mappings,
+    ) = prepare_label_mappings(
+        raw_datasets=raw_datasets,
+        model_args=model_args,
+        data_args=data_args,
+    )
 
     config = AutoConfig.from_pretrained(
         model_args.config_name
@@ -493,16 +659,6 @@ def main():
     elif training_args.bf16:
         config.torch_dtype = torch.bfloat16
     model_cls = get_model(model_args)
-    if model_args.classifier_configs is not None:
-        if os.path.exists(model_args.classifier_configs):
-            classifier_configs = json.load(open(model_args.classifier_configs))
-        else:
-            classifier_configs = parse_dict(model_args.classifier_configs)
-        aspect_key = list(classifier_configs.keys())
-    else:
-        classifier_configs = None
-        aspect_key = model_args.aspect_key
-
     config.update(
         {
             "freeze_encoder": model_args.freeze_encoder,
@@ -516,80 +672,6 @@ def main():
             "device_map": model_args.device_map,
         }
     )
-    if aspect_key is None:
-        aspect_key = []
-    elif isinstance(aspect_key, str):
-        aspect_key = [aspect_key]
-    else:
-        aspect_key = list(aspect_key)
-
-    label_candidates = ["labels", "label", "target"]
-    for split, dataset in raw_datasets.items():
-        for head in aspect_key:
-            if head in dataset.column_names:
-                continue
-            renamed = False
-            for candidate in label_candidates:
-                if candidate in dataset.column_names:
-                    dataset = dataset.rename_column(candidate, head)
-                    renamed = True
-                    break
-            if not renamed:
-                raise ValueError(
-                    f"Expected label column for head '{head}' not found in dataset columns: {dataset.column_names}"
-                )
-        raw_datasets[split] = dataset
-
-    label_name_mappings: Dict[str, Dict[int, str]] = {}
-
-    for head in aspect_key:
-        sample_values = []
-        for dataset in raw_datasets.values():
-            if head in dataset.column_names:
-                values = [v for v in dataset[head] if v is not None]
-                if values:
-                    sample_values.extend(values)
-                    break
-        if not sample_values:
-            continue
-        if isinstance(sample_values[0], str):
-            unique_values = sorted({v for ds in raw_datasets.values() if head in ds.column_names for v in ds[head]})
-            label_to_id_map = {label: idx for idx, label in enumerate(unique_values)}
-            label_name_mappings[head] = {idx: label for label, idx in label_to_id_map.items()}
-
-            def _encode_labels(example):
-                value = example.get(head)
-                if value is not None and value in label_to_id_map:
-                    example[head] = label_to_id_map[value]
-                return example
-
-            raw_datasets = raw_datasets.map(
-                _encode_labels,
-                desc=f"Encoding labels for {head}",
-                load_from_cache_file=not data_args.overwrite_cache,
-            )
-
-    if model_args.corr_labels is not None:
-        if os.path.exists(model_args.corr_labels):
-            corr_labels = json.load(open(model_args.corr_labels))
-        else:
-            corr_labels = parse_dict(model_args.corr_labels)
-    else:
-        corr_labels = {}
-    if model_args.corr_weights is not None:
-        if os.path.exists(model_args.corr_weights):
-            corr_weights = json.load(open(model_args.corr_weights))
-        else:
-            corr_weights = parse_dict(model_args.corr_weights)
-    else:
-        corr_weights = {}
-
-    classifier_configs_for_trainer = (
-        classifier_configs
-        if classifier_configs is not None
-        else {head: {"objective": model_args.objective} for head in aspect_key}
-    )
-
     labels = list(classifier_configs_for_trainer.keys())
     id2_head = {i: head for i, head in enumerate(labels)}
     model = model_cls(model_config=config, classifier_configs=classifier_configs)
@@ -600,7 +682,7 @@ def main():
         for param in model.backbone.parameters():
             param.requires_grad = True
 
-    print(f"model architecture: {model}")
+    logger.debug("Model architecture: %s", model)
     # Padding strategy
     if data_args.pad_to_max_length:
         padding = "longest"
@@ -648,7 +730,7 @@ def main():
         batched = False
     
     with training_args.main_process_first(desc="dataset map pre-processing"):
-        print(f"raw_datasets: {raw_datasets}")
+        logger.debug("Raw datasets before tokenization: %s", raw_datasets)
         raw_datasets = raw_datasets.map(
             preprocess_function,
             batched=batched,
@@ -692,7 +774,9 @@ def main():
 
     collator_dtype = getattr(config, "torch_dtype", torch.float32)
 
-    print(f"torch dtype: {config.torch_dtype}, collator_dtype: {collator_dtype}")
+    logger.debug(
+        "Torch dtype: %s, collator dtype: %s", config.torch_dtype, collator_dtype
+    )
     data_collator = DataCollatorForBiEncoder(
         tokenizer=tokenizer,
         padding="max_length",
@@ -700,26 +784,12 @@ def main():
         dtype=collator_dtype,
     )
     
-    # try:
-    # WANDBログ開始（resumeなどオプションも可
-    wandb_project = training_args.wandb_project.replace("_train.csv", "").replace("data_preprocessed/", "")
-    wandb_project_name = training_args.wandb_project_name
-    if model_args.freeze_encoder:
-        model_id = model_args.model_name_or_path.split("/")[-1]
-        wandb.init(
-            project=f"{model_id}_{max_train_samples}_{wandb_project}",
-            entity="2959648335-university-of-tokyo",
-            name=wandb_project_name,
-            config=classifier_configs,
-        )
-        
-    else:
-        model_id = model_args.model_name_or_path.split("/")[-1]
-        wandb.init(
-            project=f"{model_id}-Hot_{max_train_samples}_{wandb_project}",
-            entity="2959648335-university-of-tokyo",
-            name=wandb_project_name,
-        )
+    _ = initialize_wandb(
+        model_args=model_args,
+        training_args=training_args,
+        classifier_configs=classifier_configs,
+        max_train_samples=max_train_samples,
+    )
         
     trainer_state = {"trainer": None}
 
