@@ -11,7 +11,7 @@ from sklearn.metrics import (
 )
 from itertools import combinations
 import math
-from typing import Union, List, Dict, Optional, Callable
+from typing import Union, List, Dict, Optional, Callable, Iterator, Any, TypedDict
 
 def flatten_floats(
     data: Union[List[float], List[List[float]]]
@@ -86,6 +86,228 @@ def find_best_threshold(y_true, scores, n_thresholds=100):
 
     return float(best_thr), float(best_f1), float(best_acc)
 
+
+def _clean_and_concat(*arrays: Optional[Any]) -> np.ndarray:
+    """Remove NaNs from the given arrays and concatenate the remaining values."""
+    cleaned_parts: List[np.ndarray] = []
+    for arr in arrays:
+        if arr is None:
+            continue
+        arr_np = np.asarray(arr, dtype=float).ravel()
+        if arr_np.size == 0:
+            continue
+        arr_np = arr_np[~np.isnan(arr_np)]
+        if arr_np.size:
+            cleaned_parts.append(arr_np)
+    if cleaned_parts:
+        return np.concatenate(cleaned_parts, axis=0)
+    return np.array([], dtype=float)
+
+
+class HeadBatch(TypedDict):
+    head: str
+    config: Dict[str, Any]
+    mask: np.ndarray
+    scores: np.ndarray
+    pos: np.ndarray
+    neg: np.ndarray
+
+
+def _iter_active_heads(
+    preds: Dict[str, np.ndarray],
+    labels: np.ndarray,
+    active_heads: List[str],
+    classifier_configs: Dict[str, Dict],
+) -> Iterator[HeadBatch]:
+    _ = labels  # Kept for signature compatibility
+    mask_template = np.asarray(active_heads)
+    for head, cfg in classifier_configs.items():
+        mask = np.asarray(mask_template == head, dtype=bool)
+        if not mask.any():
+            continue
+        score_raw = preds.get(head)
+        pos_raw = preds.get(f"{head}_pos_similarity")
+        neg_raw = preds.get(f"{head}_neg_similarity")
+        scores = np.asarray(score_raw, dtype=float) if score_raw is not None else np.array([], dtype=float)
+        pos = np.asarray(pos_raw, dtype=float) if pos_raw is not None else np.array([], dtype=float)
+        neg = np.asarray(neg_raw, dtype=float) if neg_raw is not None else np.array([], dtype=float)
+        yield {
+            "head": head,
+            "config": cfg,
+            "mask": mask,
+            "scores": scores,
+            "pos": pos,
+            "neg": neg,
+        }
+
+
+def _extract_scores_and_truths(
+    batch: HeadBatch,
+    labels: np.ndarray,
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    scores = np.asarray(batch["scores"], dtype=float)
+    mask = batch["mask"]
+    if scores.shape[0] != mask.shape[0]:
+        return None
+    truths = np.asarray(labels, dtype=float)[mask].astype(float).flatten()
+    scores_subset = scores[mask].astype(float).flatten()
+    return scores_subset, truths
+
+
+def _handle_binary_classification(
+    metrics: Dict[str, float],
+    batch: HeadBatch,
+    labels: np.ndarray,
+    preds: Dict[str, np.ndarray],
+    train_centroids: Dict[str, Dict[str, Dict[int, np.ndarray]]],
+    embedding_eval_mode: str,
+) -> None:
+    extracted = _extract_scores_and_truths(batch, labels)
+    if not extracted:
+        return
+    scores_subset, truths = extracted
+    if scores_subset.size == 0:
+        return
+    head = batch["head"]
+    y_true = truths.astype(int)
+    best_thr, best_f1, best_acc = find_best_threshold(y_true, scores_subset)
+    try:
+        auc = roc_auc_score(y_true, scores_subset)
+    except Exception:
+        auc = float("nan")
+    mse = mean_squared_error(y_true, scores_subset)
+
+    metrics[f"{head}_best-threshold"] = float(best_thr)
+    metrics[f"{head}_best-accuracy"] = float(best_acc)
+    metrics[f"{head}_best-f1"] = float(best_f1)
+    metrics[f"{head}_auc"] = float(auc)
+    metrics[f"{head}_mse"] = float(mse)
+
+
+def _handle_regression(
+    metrics: Dict[str, float],
+    batch: HeadBatch,
+    labels: np.ndarray,
+    preds: Dict[str, np.ndarray],
+    train_centroids: Dict[str, Dict[str, Dict[int, np.ndarray]]],
+    embedding_eval_mode: str,
+) -> None:
+    extracted = _extract_scores_and_truths(batch, labels)
+    if not extracted:
+        return
+    scores_subset, truths = extracted
+    if scores_subset.size == 0:
+        return
+    head = batch["head"]
+    mse = mean_squared_error(truths, scores_subset)
+    pear = pearsonr(scores_subset, truths)[0] if scores_subset.size > 1 else 0.0
+    spearman = spearmanr(scores_subset, truths).correlation
+
+    metrics[f"{head}_mse"] = float(mse)
+    metrics[f"{head}_single-pearson"] = float(pear)
+    metrics[f"{head}_single-spearman"] = float(spearman)
+
+
+def _handle_info_nce(
+    metrics: Dict[str, float],
+    batch: HeadBatch,
+    labels: np.ndarray,
+    preds: Dict[str, np.ndarray],
+    train_centroids: Dict[str, Dict[str, Dict[int, np.ndarray]]],
+    embedding_eval_mode: str,
+) -> None:
+    head = batch["head"]
+    mask = batch["mask"]
+    embedding_source = preds.get("embeddings") if embedding_eval_mode == "original" else preds.get(head)
+    if embedding_source is None:
+        return
+    embeddings = np.asarray(embedding_source, dtype=float)
+    if embeddings.ndim != 2:
+        return
+    emb_subset = embeddings[mask]
+    label_subset = labels[mask] if len(labels) else np.array([], dtype=int)
+    label_subset = np.asarray(label_subset)
+    if label_subset.ndim > 1:
+        label_subset = label_subset.reshape(label_subset.shape[0], -1)
+        if label_subset.shape[1] == 1:
+            label_subset = label_subset[:, 0]
+        else:
+            label_subset = label_subset.flatten()
+    label_subset = label_subset.astype(int, copy=False)
+    if emb_subset.shape[0] == 0:
+        return
+
+    head_centroids = _select_centroids(
+        (train_centroids or {}).get(head),
+        embedding_eval_mode,
+    )
+    if not head_centroids:
+        return
+
+    centroid_labels = np.array(list(head_centroids.keys()), dtype=int)
+    centroid_vectors = np.asarray(
+        [head_centroids[label] for label in centroid_labels], dtype=float
+    )
+    if centroid_vectors.ndim != 2 or centroid_vectors.shape[0] == 0:
+        return
+    if centroid_vectors.shape[1] != emb_subset.shape[1]:
+        return
+
+    diff = emb_subset[:, None, :] - centroid_vectors[None, :, :]
+    distances = np.sum(diff * diff, axis=2)
+    nearest_idx = np.argmin(distances, axis=1)
+    y_pred = centroid_labels[nearest_idx]
+
+    if label_subset.size > 0:
+        acc = accuracy_score(label_subset, y_pred)
+        f1 = f1_score(label_subset, y_pred, average="macro", zero_division=0)
+        ami = adjusted_mutual_info_score(label_subset, y_pred)
+        v_measure = v_measure_score(label_subset, y_pred)
+        metrics[f"{head}_knn_accuracy"] = float(acc)
+        metrics[f"{head}_knn_macro_f1"] = float(f1)
+        metrics[f"{head}_cluster_ami"] = float(ami)
+        metrics[f"{head}_cluster_v_measure"] = float(v_measure)
+
+
+def _handle_contrastive_logit(
+    metrics: Dict[str, float],
+    batch: HeadBatch,
+    labels: np.ndarray,
+    preds: Dict[str, np.ndarray],
+    train_centroids: Dict[str, Dict[str, Dict[int, np.ndarray]]],
+    embedding_eval_mode: str,
+) -> None:
+    head = batch["head"]
+    mask = batch["mask"]
+    pos = batch["pos"]
+    neg = batch["neg"]
+    if pos.shape[0] != mask.shape[0] or neg.shape[0] != mask.shape[0]:
+        return
+
+    pos_hot = pos[mask]
+    neg_hot = neg[mask]
+    trip_acc = float(np.mean(pos_hot > neg_hot))
+    avg_pos = float(np.mean(pos_hot))
+    avg_neg = float(np.mean(neg_hot))
+    metrics[f"{head}_triplet_accuracy"] = trip_acc
+    metrics[f"{head}_avg_positive_similarity"] = avg_pos
+    metrics[f"{head}_avg_negative_similarity"] = avg_neg
+
+    anchor_raw = preds.get(f"{head}_anchor_prob")
+    if anchor_raw is None:
+        return
+    probs = np.asarray(anchor_raw, dtype=float)
+    if probs.shape[0] != mask.shape[0]:
+        return
+    probs = probs[mask]
+    y_true = labels[mask].astype(int)
+    if probs.ndim == 2 and y_true.size > 0:
+        y_pred = np.argmax(probs, axis=1)
+        acc2 = accuracy_score(y_true, y_pred)
+        f12 = f1_score(y_true, y_pred, average="macro")
+        metrics[f"{head}_anchor_accuracy"] = float(acc2)
+        metrics[f"{head}_anchor_macro_f1"] = float(f12)
+
 def _select_centroids(
     entry: Optional[Dict],
     mode: str,
@@ -129,6 +351,7 @@ def compute_metrics(
     print(f"predictions shape: {len(preds)}, label_dict shape: {len(label_dict)}")
     
     labels = label_dict["labels"] if isinstance(label_dict, dict) else label_dict
+    labels = np.asarray(labels)
     # print(f"preds: {preds}")
     # print(f"labels: {labels}")
     # print(f"active_heads: {label_dict['active_heads']}")
@@ -136,169 +359,33 @@ def compute_metrics(
     metrics: dict = {}
     head_vectors: dict = {}
     train_centroids = train_centroid_getter() if train_centroid_getter is not None else {}
-    
-     # 各ベクトルを取得して float 配列に変換
-    origin_pair = np.asarray(preds["original"], dtype=float)
-    origin_pos  = np.asarray(preds["original_pos_similarity"], dtype=float)
-    origin_neg  = np.asarray(preds["original_neg_similarity"], dtype=float)
 
-    # NaN 以外の要素だけ抽出するヘルパー
-    def clean(arr: np.ndarray) -> np.ndarray:
-        return arr[~np.isnan(arr)]
+    head_vectors["original"] = _clean_and_concat(
+        preds.get("original"),
+        preds.get("original_pos_similarity"),
+        preds.get("original_neg_similarity"),
+    )
 
-    # クリーンした配列を追加（空配列はスキップ）
-    origin_arrays = []
-    for arr in (origin_pair, origin_pos, origin_neg):
-        cleaned = clean(arr)
-        if cleaned.size > 0:
-            origin_arrays.append(cleaned)
+    handler_map = {
+        "binary_classification": _handle_binary_classification,
+        "regression": _handle_regression,
+        "infoNCE": _handle_info_nce,
+        "contrastive_logit": _handle_contrastive_logit,
+    }
 
-    # 連結
-    if origin_arrays:
-        origin_vec = np.concatenate(origin_arrays, axis=0)
-    else:
-        origin_vec = np.array([], dtype=float)
+    for head_info in _iter_active_heads(preds, labels, active_heads, classifier_configs):
+        head = head_info["head"]
+        scores = head_info["scores"]
+        pos = head_info["pos"]
+        neg = head_info["neg"]
+        obj = head_info["config"]["objective"]
 
-    head_vectors["original"] = origin_vec
+        head_vectors[head] = _clean_and_concat(scores, pos, neg)
 
-    for head, cfg in classifier_configs.items():
-        arrays = []
-
-        # 各ベクトルを取得して float 配列に変換
-        pair = np.asarray(preds[head], dtype=float)
-        pos  = np.asarray(preds[f"{head}_pos_similarity"], dtype=float)
-        neg  = np.asarray(preds[f"{head}_neg_similarity"], dtype=float)
-
-        # NaN 以外の要素だけ抽出するヘルパー
-        def clean(arr: np.ndarray) -> np.ndarray:
-            return arr[~np.isnan(arr)]
-
-        # クリーンした配列を追加（空配列はスキップ）
-        for arr in (pair, pos, neg):
-            cleaned = clean(arr)
-            if cleaned.size > 0:
-                arrays.append(cleaned)
-
-        # 連結
-        if arrays:
-            vec = np.concatenate(arrays, axis=0)
-        else:
-            vec = np.array([], dtype=float)
-
-        head_vectors[head] = vec
-        
-        obj = cfg["objective"]
-        # サンプルごとにこの head が active な index を集める
-        # print(f"Processing head: {head}, objective: {obj}, active_heads: {active_heads}")
-        idx = [True if h == head else False for h in active_heads]
-        if not any(idx):
+        handler = handler_map.get(obj)
+        if handler is None:
             continue
-
-        if obj in ("regression", "binary_classification"):
-            # 2文タスク: 予測スコアとラベル
-            scores = np.asarray(preds[head], dtype=float)[idx]
-            truths = labels[idx].astype(float).flatten()
-            # print(f"Head: {head}, scores shape: {scores.shape}, truths shape: {truths.shape}")
-
-            if obj == "binary_classification":
-                y_true = truths.astype(int)
-                best_thr, best_f1, best_acc = find_best_threshold(y_true, scores)
-                try:
-                    auc = roc_auc_score(y_true, scores)
-                except:
-                    auc = float("nan")
-                mse = mean_squared_error(y_true, scores)
-
-                metrics[f"{head}_best-threshold"] = float(best_thr)
-                metrics[f"{head}_best-accuracy"] = float(best_acc)
-                metrics[f"{head}_best-f1"]       = float(best_f1)
-                metrics[f"{head}_auc"]      = float(auc)
-                metrics[f"{head}_mse"]      = float(mse)
-
-            else:  # regression
-                mse = mean_squared_error(truths, scores)
-                # サンプル数が 2 以上あれば計算
-                pear = pearsonr(scores, truths)[0] if scores.size>1 else 0.0
-
-                metrics[f"{head}_mse"]     = float(mse)
-                metrics[f"{head}_single-pearson"] = float(pear)
-                metrics[f"{head}_single-spearman"] = float(spearmanr(scores, truths).correlation)
-
-        elif obj == "infoNCE":
-            embedding_source = preds.get("embeddings") if embedding_eval_mode == "original" else preds.get(head)
-            if embedding_source is None:
-                continue
-            embeddings = np.asarray(embedding_source, dtype=float)
-            if embeddings.ndim != 2:
-                continue
-            mask = np.asarray(idx, dtype=bool)
-            emb_subset = embeddings[mask]
-            label_subset = labels[mask] if len(labels) else np.array([], dtype=int)
-            label_subset = np.asarray(label_subset)
-            if label_subset.ndim > 1:
-                label_subset = label_subset.reshape(label_subset.shape[0], -1)
-                if label_subset.shape[1] == 1:
-                    label_subset = label_subset[:, 0]
-                else:
-                    label_subset = label_subset.flatten()
-            label_subset = label_subset.astype(int, copy=False)
-            if emb_subset.shape[0] == 0:
-                continue
-
-            head_centroids = _select_centroids(
-                (train_centroids or {}).get(head),
-                embedding_eval_mode,
-            )
-            if not head_centroids:
-                continue
-
-            centroid_labels = np.array(list(head_centroids.keys()), dtype=int)
-            centroid_vectors = np.asarray(
-                [head_centroids[label] for label in centroid_labels], dtype=float
-            )
-            if centroid_vectors.ndim != 2 or centroid_vectors.shape[0] == 0:
-                continue
-            if centroid_vectors.shape[1] != emb_subset.shape[1]:
-                continue
-
-            diff = emb_subset[:, None, :] - centroid_vectors[None, :, :]
-            distances = np.sum(diff * diff, axis=2)
-            nearest_idx = np.argmin(distances, axis=1)
-            y_pred = centroid_labels[nearest_idx]
-
-            if label_subset.size > 0:
-                acc = accuracy_score(label_subset, y_pred)
-                f1 = f1_score(label_subset, y_pred, average="macro", zero_division=0)
-                ami = adjusted_mutual_info_score(label_subset, y_pred)
-                v_measure = v_measure_score(label_subset, y_pred)
-                metrics[f"{head}_knn_accuracy"] = float(acc)
-                metrics[f"{head}_knn_macro_f1"] = float(f1)
-                metrics[f"{head}_cluster_ami"] = float(ami)
-                metrics[f"{head}_cluster_v_measure"] = float(v_measure)
-
-        elif obj == "contrastive_logit":
-            # 3文タスク: pos/neg を縦連結してベクトル化
-
-            pos_hot = pos[idx]
-            neg_hot = neg[idx]
-            # Triplet accuracy, avg pos/neg
-            trip_acc = float(np.mean(pos_hot > neg_hot))
-            avg_pos  = float(np.mean(pos_hot))
-            avg_neg  = float(np.mean(neg_hot))
-            metrics[f"{head}_triplet_accuracy"]       = trip_acc
-            metrics[f"{head}_avg_positive_similarity"] = avg_pos
-            metrics[f"{head}_avg_negative_similarity"] = avg_neg
-
-            # Anchor‐prob での多クラス評価
-            probs = np.asarray(preds[f"{head}_anchor_prob"], dtype=float)[idx]
-            # int ラベルとして解釈
-            y_true = labels[idx].astype(int)
-            if probs.ndim == 2 and y_true.size > 0:
-                y_pred = np.argmax(probs, axis=1)
-                acc2 = accuracy_score(y_true, y_pred)
-                f12  = f1_score(y_true, y_pred, average="macro")
-                metrics[f"{head}_anchor_accuracy"] = float(acc2)
-                metrics[f"{head}_anchor_macro_f1"] = float(f12)
+        handler(metrics, head_info, labels, preds, train_centroids, embedding_eval_mode)
 
     # for k, v in head_vectors.items():
     #     print(f"Head: {k}, vector length: {len(v)}")
