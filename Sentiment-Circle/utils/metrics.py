@@ -327,4 +327,7 @@ def compute_metrics(
         metrics[f"{h1}_vs_{h2}_relation-pearson"] = float(pcc)
         metrics[f"{h1}_vs_{h2}_relation-spearman"] = float(scc)
 
+    if embedding_eval_mode == "original":
+        metrics = {f"original_{key}": value for key, value in metrics.items()}
+
     return metrics

@@ -225,7 +225,7 @@ class Pooler(nn.Module):
     def __init__(self, pooler_type):
         super().__init__()
         self.pooler_type = pooler_type
-        assert self.pooler_type in ['cls', 'cls_before_pooler', 'avg', 'avg_top2', 'avg_first_last', 'last'], 'unrecognized pooling type %s' % self.pooler_type
+        assert self.pooler_type in ['cls', 'cls_before_pooler', 'avg', 'avg_top2', 'avg_first_last', 'last', 'max'], 'unrecognized pooling type %s' % self.pooler_type
 
     def forward(self, attention_mask, outputs, target_layer=-1):
         last_hidden = outputs.last_hidden_state
@@ -237,6 +237,14 @@ class Pooler(nn.Module):
             return last_hidden[:, 0]
         elif self.pooler_type == 'avg':
             return ((hidden_states[target_layer] * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)).to(dtype)
+        elif self.pooler_type == 'max':
+            # mask padded positions with minimal float then collapse via max
+            mask = attention_mask.unsqueeze(-1).bool()
+            masked_hidden = hidden_states[target_layer].masked_fill(
+                ~mask, torch.finfo(hidden_states[target_layer].dtype).min
+            )
+            pooled_result, _ = masked_hidden.max(dim=1)
+            return pooled_result.to(dtype)
         elif self.pooler_type == 'avg_first_last':
             first_hidden = hidden_states[0]
             last_hidden = hidden_states[-1]

@@ -10,7 +10,7 @@ mkdir -p "${OUTPUT_ROOT}"
 
 MODEL_NAME=${MODEL:-mixedbread-ai/mxbai-embed-large-v1}
 POOLER_TYPE=${POOLER_TYPE:-avg}
-MAX_SEQ_LEN=${MAX_SEQ_LENGTH:-256}
+MAX_SEQ_LEN=${MAX_SEQ_LENGTH:-512}
 LEARNING_RATE=${LR:-1e-4}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-128}
 EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-256}
@@ -49,7 +49,7 @@ mkdir -p "${OUTPUT_DIR}/${WANDB_PROJECT}/${WANDB_PROJECT_NAME}"
 
 CUDA_VISIBLE_DEVICES=0 python "${SCRIPT_DIR}/train.py" \
   --model_name_or_path "${MODEL_NAME}" \
-  --output_dir "${OUTPUT_DIR}" \
+  --output_dir "${OUTPUT_DIR}/${WANDB_PROJECT}/${WANDB_PROJECT_NAME}" \
   --train_file "${DATA_DIR}/Train_df.csv" \
   --validation_file "${DATA_DIR}/Valid_df.csv" \
   --test_file "${DATA_DIR}/Test_df.csv" \
