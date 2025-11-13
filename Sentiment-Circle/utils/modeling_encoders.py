@@ -20,7 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 def concat_features(*features):
-    return torch.cat(features, dim=0) if features[0] is not None else None
+    filtered = [feature for feature in features if feature is not None]
+    if not filtered:
+        return None
+    return torch.cat(filtered, dim=0)
 
 
 def _sentence_kwargs(batch: dict, suffix: str = "") -> dict:
@@ -199,6 +202,74 @@ def calculate_pos_neg_similarity(
 
     return pos_sim, neg_sim
 
+class _ClassifierStrategy:
+    def single(self, model: "BiEncoderForClassification", name: str, classifier: nn.Module, features: list[torch.Tensor]) -> dict:
+        return {}
+
+    def pair(self, model: "BiEncoderForClassification", name: str, classifier: nn.Module, features: list[torch.Tensor]) -> dict:
+        return {}
+
+    def triplet(self, model: "BiEncoderForClassification", name: str, classifier: nn.Module, features: list[torch.Tensor]) -> dict:
+        return {}
+
+    def classify(self, model: "BiEncoderForClassification", name: str, classifier: nn.Module, features: list[torch.Tensor]) -> dict:
+        return {}
+
+
+class _DefaultClassifierStrategy(_ClassifierStrategy):
+    def single(self, model, name, classifier, features):
+        embedding = classifier.encode(features[0]).to(features[0].dtype)
+        return {name: embedding}
+
+    def pair(self, model, name, classifier, features):
+        output1 = classifier(features[0])
+        output2 = classifier(features[1])
+        similarity = calculate_similarity(name, output1, output2, model.classifier_configs)
+        return {name: similarity}
+
+    def triplet(self, model, name, classifier, features):
+        output1 = classifier(features[0])
+        output2 = classifier(features[1])
+        output3 = classifier(features[2])
+        pos_similarity, neg_similarity = calculate_pos_neg_similarity(
+            name, output1, output2, output3, model.classifier_configs
+        )
+        return {
+            f"{name}_pos_similarity": pos_similarity,
+            f"{name}_neg_similarity": neg_similarity,
+        }
+
+
+class _ContrastiveLogitStrategy(_ClassifierStrategy):
+    def single(self, model, name, classifier, features):
+        embedding = classifier.encode(features[0]).to(features[0].dtype)
+        return {name: embedding}
+
+    def pair(self, model, name, classifier, features):
+        output1 = classifier.encode(features[0])
+        output2 = classifier.encode(features[1])
+        similarity = calculate_similarity(name, output1, output2, model.classifier_configs)
+        return {name: similarity}
+
+    def triplet(self, model, name, classifier, features):
+        output1, prob1 = classifier(features[0])
+        output2, prob2 = classifier(features[1])
+        output3, prob3 = classifier(features[2])
+        pos_similarity, neg_similarity = calculate_pos_neg_similarity(
+            name, output1, output2, output3, model.classifier_configs
+        )
+        return {
+            f"{name}_pos_similarity": pos_similarity,
+            f"{name}_neg_similarity": neg_similarity,
+            f"{name}_anchor_prob": prob1,
+            f"{name}_positive_prob": prob2,
+            f"{name}_negative_prob": prob3,
+        }
+
+    def classify(self, model, name, classifier, features):
+        _, prob = classifier(features[0])
+        return {f"{name}_prob": prob}
+
 class QuadrupletLoss:
     def __init__(self, distance_function, margin=1.0):
         'A cosine distance margin quadruplet loss'
@@ -270,6 +341,14 @@ class Pooler(nn.Module):
   
 class BiEncoderForClassification(PreTrainedModel):
     '''Encoder model with backbone and classification head.'''
+    _BACKBONE_ARG_NAMES = (
+        "input_ids",
+        "attention_mask",
+        "token_type_ids",
+        "position_ids",
+        "head_mask",
+        "inputs_embeds",
+    )
     def __init__(self, model_config, classifier_configs):
         """
         Args:
@@ -319,6 +398,10 @@ class BiEncoderForClassification(PreTrainedModel):
 
         self.embedding_classifiers = nn.ModuleDict()
         self.clf_configs = {}
+        self._default_classifier_strategy = _DefaultClassifierStrategy()
+        self._classifier_strategies = {
+            "contrastive_logit": _ContrastiveLogitStrategy(),
+        }
 
         if self.classifier_configs:
             # Build classifiers via factory
@@ -353,6 +436,107 @@ class BiEncoderForClassification(PreTrainedModel):
             # # 出力のdtype
             # print("出力のdtype:", output.dtype if isinstance(output, torch.Tensor) else type(output))
 
+
+    def _get_classifier_strategy(self, classifier_type: str) -> _ClassifierStrategy:
+        return self._classifier_strategies.get(classifier_type, self._default_classifier_strategy)
+
+    def _build_sentence(self, **kwargs) -> dict:
+        return {name: kwargs.get(name) for name in self._BACKBONE_ARG_NAMES}
+
+    def _infer_batch_size(self, sentence: dict) -> int:
+        for name in self._BACKBONE_ARG_NAMES:
+            tensor = sentence.get(name)
+            if tensor is not None:
+                return tensor.shape[0]
+        raise ValueError("Cannot infer batch size from empty sentence inputs.")
+
+    def _run_backbone(self, sentences: list[dict]) -> tuple:
+        merged = {}
+        for name in self._BACKBONE_ARG_NAMES:
+            tensors = [sentence.get(name) for sentence in sentences]
+            merged[name] = concat_features(*tensors)
+
+        outputs = self.backbone(
+            input_ids=merged["input_ids"],
+            attention_mask=merged["attention_mask"],
+            token_type_ids=merged["token_type_ids"],
+            position_ids=merged["position_ids"],
+            head_mask=merged["head_mask"],
+            inputs_embeds=merged["inputs_embeds"],
+            output_hidden_states=self.output_hidden_states,
+        )
+
+        if torch.isnan(outputs.last_hidden_state).any():
+            raise ValueError("NaN detected in outputs.last_hidden_state")
+
+        batch_sizes = [self._infer_batch_size(sentence) for sentence in sentences]
+        return outputs, merged["attention_mask"], batch_sizes
+
+    @staticmethod
+    def _split_by_batch(tensor: torch.Tensor, batch_sizes: list[int]) -> list[torch.Tensor]:
+        splits = []
+        offset = 0
+        for size in batch_sizes:
+            splits.append(tensor[offset : offset + size])
+            offset += size
+        return splits
+
+    def _pool_and_split(
+        self,
+        attention_mask: torch.Tensor,
+        outputs,
+        batch_sizes: list[int],
+        target_layer: int | None = None,
+    ) -> list[torch.Tensor]:
+        layer = target_layer if target_layer is not None else -1
+        pooled = self.pooler(attention_mask, outputs, layer)
+        return self._split_by_batch(pooled, batch_sizes)
+
+    def _apply_classifiers(
+        self,
+        attention_mask: torch.Tensor,
+        outputs,
+        batch_sizes: list[int],
+        mode: str,
+    ) -> dict:
+        if not self.classifier_configs:
+            return {}
+
+        results = {}
+        for name, classifier in self.embedding_classifiers.items():
+            target_layer = int(self.classifier_configs[name]["layer"])
+            features = self._pool_and_split(attention_mask, outputs, batch_sizes, target_layer)
+            strategy = self._get_classifier_strategy(self.classifier_configs[name]["type"])
+            handler = getattr(strategy, mode)
+            results.update(handler(self, name, classifier, features))
+        return results
+
+    def _postprocess_single(self, outputs, attention_mask: torch.Tensor, batch_sizes: list[int]) -> dict:
+        (features,) = self._pool_and_split(attention_mask, outputs, batch_sizes)
+        results = {
+            "original": features,
+            "embeddings": features,
+        }
+        results.update(self._apply_classifiers(attention_mask, outputs, batch_sizes, mode="single"))
+        return results
+
+    def _postprocess_pair(self, outputs, attention_mask: torch.Tensor, batch_sizes: list[int]) -> dict:
+        features1, features2 = self._pool_and_split(attention_mask, outputs, batch_sizes)
+        logits = cosine_similarity(features1, features2, dim=1).to(features1.dtype)
+        results = {"original": logits}
+        results.update(self._apply_classifiers(attention_mask, outputs, batch_sizes, mode="pair"))
+        return results
+
+    def _postprocess_triplet(self, outputs, attention_mask: torch.Tensor, batch_sizes: list[int]) -> dict:
+        features1, features2, features3 = self._pool_and_split(attention_mask, outputs, batch_sizes)
+        logits1 = cosine_similarity(features1, features2, dim=1).to(features1.dtype)
+        logits2 = cosine_similarity(features1, features3, dim=1).to(features1.dtype)
+        results = {
+            "original_pos_similarity": logits1,
+            "original_neg_similarity": logits2,
+        }
+        results.update(self._apply_classifiers(attention_mask, outputs, batch_sizes, mode="triplet"))
+        return results
 
 
     def forward(
@@ -436,88 +620,28 @@ class BiEncoderForClassification(PreTrainedModel):
         input_ids_2, attention_mask_2, token_type_ids_2, position_ids_2, head_mask_2, inputs_embeds_2,
         **kwargs
     ):
-        bsz = input_ids.shape[0]
-        input_ids = concat_features(input_ids, input_ids_2)
-        attention_mask = concat_features(attention_mask, attention_mask_2)
-        token_type_ids = concat_features(token_type_ids, token_type_ids_2)
-        position_ids = concat_features(position_ids, position_ids_2)
-        head_mask = concat_features(head_mask, head_mask_2)
-        inputs_embeds = concat_features(inputs_embeds, inputs_embeds_2)
-        # print(f"input_ids: {input_ids}, attention_mask: {attention_mask}")
-        # print(f"input_ids shape: {input_ids.shape}, attention_mask shape: {attention_mask.shape}")
-        # print(f"device: input_ids {input_ids.device}, attention_mask {attention_mask.device}")
-        # print(f"device: backbone {self.backbone.device}")
-        outputs = self.backbone(
+        sentences = [
+            self._build_sentence(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
                 position_ids=position_ids,
                 head_mask=head_mask,
                 inputs_embeds=inputs_embeds,
-                output_hidden_states=self.output_hidden_states,
-                )
-        # print(f"outputs {outputs}")
-        # nanチェック
-        if torch.isnan(outputs.last_hidden_state).any():
-            raise ValueError("NaN detected in outputs.last_hidden_state")
-        outputs_dict = {}
-        if self.classifier_configs:
-            for name, classifier in self.embedding_classifiers.items():
-                target_layer = int(self.classifier_configs[name]["layer"])
+            ),
+            self._build_sentence(
+                input_ids=input_ids_2,
+                attention_mask=attention_mask_2,
+                token_type_ids=token_type_ids_2,
+                position_ids=position_ids_2,
+                head_mask=head_mask_2,
+                inputs_embeds=inputs_embeds_2,
+            ),
+        ]
+        outputs, attention_mask, batch_sizes = self._run_backbone(sentences)
+        return self._postprocess_pair(outputs, attention_mask, batch_sizes)
 
-                # （通常、hidden_states[0] が入力埋め込み、以降が各層の出力となる）
-                # 指定層の出力に対して pooler を適用（例：[CLS] トークンの抽出等）
-                pooled_features = self.pooler(attention_mask, outputs, target_layer)  # shape: (2*bsz, hidden_size)
-                # print(f"pooled_features: {pooled_features}")
-                # print(f"pooled_features: {pooled_features.shape}, dtype: {pooled_features.dtype}, device: {pooled_features.device}")
-                # siamese 用に、2*bsz の出力をそれぞれ前半と後半に分割する
-                # print(f"bsz: {bsz}, pooled_features shape: {pooled_features.shape}")
-                features1, features2 = torch.split(pooled_features, bsz, dim=0)
-                # print(f"features1: {features1}, features2: {features2}")
-
-                if self.classifier_configs[name]["type"] != "contrastive_logit":
-                    # 各分類器に対して、対象の層のプール済み埋め込みを入力して出力を得る
-                    output1 = classifier(features1)  # sentence1用
-                    output2 = classifier(features2)  # sentence2用
-                    similarity = calculate_similarity(name, output1, output2, self.classifier_configs)
-                    # dummy output1, output2, similarity
-                    # output1 = torch.randn(bsz, 1, device=features1.device, dtype=features1.dtype)
-                    # output2 = torch.randn(bsz, 1, device=features2.device, dtype=features2.dtype)
-                    # similarity = torch.zeros(bsz, device=features1.device, dtype=features1.dtype)
-                    # print(f"output1: {output1}, output2: {output2}")
-                    # print(f"similarity: {similarity}")
-                else:
-                    output1 = classifier.encode(features1)  # sentence1用
-                    output2 = classifier.encode(features2)  # sentence2用
-                    # 中間層の埋め込み表現を抽出
-                    similarity = calculate_similarity(name, output1, output2, self.classifier_configs)
-                        
-                outputs_dict[name] = similarity
-        
-        features = self.pooler(attention_mask, outputs)
-        features_1, features_2 = torch.split(features, bsz, dim=0)  # [sentence1], [sentence2]
-        logits = cosine_similarity(features_1, features_2, dim=1).to(features_1.dtype)
-        # print(f"features1: {features1}")
-        # print(f"features2: {features2}")
-        # print(f"output1: {output1}")
-        # print(f"output2: {output2}")
-        # print(f"similarity: {similarity}")
-        outputs_dict["original"] = logits
-        
-        # outputs は dataclass なので、その中の Tensor から dtype を取る
-        # print(f"outputs.last_hidden_state dtype: {outputs.last_hidden_state.dtype}")
-        # if hasattr(outputs, "hidden_states"):
-        #     print(f"outputs.hidden_states[0] dtype: {outputs.hidden_states[0].dtype}")
-        # print(f"features dtype: {features.dtype}")
-        # print(f"features_1 dtype: {features_1.dtype}")
-        # print(f"features_2 dtype: {features_2.dtype}")
-        # print(f"similarity dtype: {similarity.dtype}")
-        # print(f"logits dtype: {logits.dtype}")
-        # print("=====================================")
-        return outputs_dict
-
-        
-    def encode(            
+    def encode(
             self,
             input_ids=None,
             attention_mask=None,
@@ -526,37 +650,21 @@ class BiEncoderForClassification(PreTrainedModel):
             head_mask=None,
             inputs_embeds=None,
             ):
-            """        
+            """
             Returns the embedding for single sentence.
             """
-            outputs = self.backbone(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    token_type_ids=token_type_ids,
-                    position_ids=position_ids,
+            sentence = self._build_sentence(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
                 head_mask=head_mask,
                 inputs_embeds=inputs_embeds,
-                output_hidden_states=self.output_hidden_states,
-                )
+            )
+            outputs, attention_mask, batch_sizes = self._run_backbone([sentence])
+            return self._postprocess_single(outputs, attention_mask, batch_sizes)
 
-            outputs_dict = {}
-            if self.classifier_configs:
-                for name, classifier in self.embedding_classifiers.items():
-                    target_layer = int(self.classifier_configs[name]["layer"])
-                    pooled_features = self.pooler(attention_mask, outputs, target_layer)
-                    # print(f"pooled_features dtype for classifier {name}: {pooled_features.dtype}")
-                    # print(classifier)
-                    embedding = classifier.encode(pooled_features).to(pooled_features.dtype)
-                    # print(f"embedding dtype for classifier {name}: {embedding.dtype}")
-                    outputs_dict[name] = embedding
-            
-            features = self.pooler(attention_mask, outputs)
-
-            outputs_dict["original"] = features  # original embedding
-            outputs_dict.setdefault("embeddings", features)
-            return outputs_dict
-    
-    def classify(            
+    def classify(
             self,
             input_ids=None,
             attention_mask=None,
@@ -565,33 +673,20 @@ class BiEncoderForClassification(PreTrainedModel):
             head_mask=None,
             inputs_embeds=None,
             ):
-            """        
+            """
             Returns the embedding for single sentence.
-            """ 
-            outputs = self.backbone(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    token_type_ids=token_type_ids,
-                    position_ids=position_ids,
-                    head_mask=head_mask,
-                    inputs_embeds=inputs_embeds,
-                    output_hidden_states=self.output_hidden_states,
-                    )
-                
-            outputs_dict = {}
-            if self.classifier_configs:
-                for name, classifier in self.embedding_classifiers.items():
-                    if self.classifier_configs[name]["type"] != "contrastive_logit":
-                        continue  # contrastive_logit のみを対象とする
+            """
+            sentence = self._build_sentence(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+            )
+            outputs, attention_mask, batch_sizes = self._run_backbone([sentence])
+            return self._apply_classifiers(attention_mask, outputs, batch_sizes, mode="classify")
 
-                    target_layer = int(self.classifier_configs[name]["layer"])
-                    pooled_features = self.pooler(attention_mask, outputs, target_layer)
-
-                    embedding, prob = classifier(pooled_features)
-                    outputs_dict[f"{name}_prob"] = prob  # probability for classification
-
-            return outputs_dict
-    
     def triplet_encode(
             self,
             input_ids=None,
@@ -616,76 +711,34 @@ class BiEncoderForClassification(PreTrainedModel):
             ):
         if input_ids is None or input_ids_2 is None or input_ids_3 is None:
             raise ValueError("input_ids, input_ids_2, input_ids_3 must not be None")
-        bsz1 = input_ids.shape[0]
-        bsz2 = input_ids_2.shape[0]
-        bsz3 = input_ids_3.shape[0]  
-
-        input_ids = concat_features(input_ids, input_ids_2, input_ids_3)
-        attention_mask = concat_features(attention_mask, attention_mask_2, attention_mask_3)
-        token_type_ids = concat_features(token_type_ids, token_type_ids_2, token_type_ids_3)
-        position_ids = concat_features(position_ids, position_ids_2, position_ids_3)
-        head_mask = concat_features(head_mask, head_mask_2, head_mask_3)
-        inputs_embeds = concat_features(inputs_embeds, inputs_embeds_2, inputs_embeds_3)
-
-        outputs = self.backbone(
+        sentences = [
+            self._build_sentence(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
                 position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_hidden_states=self.output_hidden_states,
-            )
-        outputs_dict = {}
-        if self.classifier_configs:
-            for name, classifier in self.embedding_classifiers.items():                
-                target_layer = int(self.classifier_configs[name]["layer"])
-                pooled_features = self.pooler(attention_mask, outputs, target_layer)  # shape: (3*bsz, hidden_size)
-
-                # siamese 用に、3*bsz の出力をそれぞれ前半、中間、後半に分割する
-                features1, features2, features3 = torch.split(pooled_features, [bsz1, bsz2, bsz3], dim=0)
-
-                if self.classifier_configs[name]["type"] != "contrastive_logit":
-                    output1 = classifier(features1)  # sentence1用
-                    output2 = classifier(features2)  # sentence2用
-                    output3 = classifier(features3)  # sentence3用
-                    pos_similarity, neg_similarity = calculate_pos_neg_similarity(
-                        name, output1, output2, output3, self.classifier_configs
-                    )
-                    outputs_dict[f"{name}_pos_similarity"] = pos_similarity
-                    outputs_dict[f"{name}_neg_similarity"] = neg_similarity
-
-                else:
-                    output1, prob1 = classifier(features1)  # sentence1用
-                    output2, prob2 = classifier(features2)  # sentence2用
-                    output3, prob3 = classifier(features3)  # sentence3用
-                    # 中間層の埋め込み表現を抽出
-                    pos_similarity, neg_similarity = calculate_pos_neg_similarity(
-                        name, output1, output2, output3, self.classifier_configs
-                    )
-
-                    outputs_dict[f"{name}_pos_similarity"] = pos_similarity
-                    outputs_dict[f"{name}_neg_similarity"] = neg_similarity
-                    outputs_dict[f"{name}_anchor_prob"] = prob1
-                    outputs_dict[f"{name}_positive_prob"] = prob2
-                    outputs_dict[f"{name}_negative_prob"] = prob3
-                    # outputs_dict[f"{name}_anchor_embedding"] = output1
-                    # outputs_dict[f"{name}_positive_embedding"] = output2
-                    # outputs_dict[f"{name}_negative_embedding"] = output3
-                
-        
-        features = self.pooler(attention_mask, outputs)  # shape: (3*bsz, hidden_size)
-
-        features_1, features_2 , features_3 = torch.split(features, [bsz1, bsz2, bsz3], dim=0)  # [sentence1], [sentence2], [sentence3]
-        logits1 = cosine_similarity(features_1, features_2, dim=1).to(features_1.dtype)  # sentence1 と sentence2 の類似度
-        logits2 = cosine_similarity(features_1, features_3, dim=1).to(features_1.dtype)  # sentence1 と sentence3 の類似度
-        outputs_dict["original_pos_similarity"] = logits1
-        outputs_dict["original_neg_similarity"] = logits2
-        # outputs_dict["original_anchor_embedding"] = features_1
-        # outputs_dict["original_positive_embedding"] = features_2
-        # outputs_dict["original_negative_embedding"] = features_3
-        
-        return outputs_dict    
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+            ),
+            self._build_sentence(
+                input_ids=input_ids_2,
+                attention_mask=attention_mask_2,
+                token_type_ids=token_type_ids_2,
+                position_ids=position_ids_2,
+                head_mask=head_mask_2,
+                inputs_embeds=inputs_embeds_2,
+            ),
+            self._build_sentence(
+                input_ids=input_ids_3,
+                attention_mask=attention_mask_3,
+                token_type_ids=token_type_ids_3,
+                position_ids=position_ids_3,
+                head_mask=head_mask_3,
+                inputs_embeds=inputs_embeds_3,
+            ),
+        ]
+        outputs, attention_mask, batch_sizes = self._run_backbone(sentences)
+        return self._postprocess_triplet(outputs, attention_mask, batch_sizes)
 
     def save_pretrained(self, model_save_directory, **kwargs):
         os.makedirs(model_save_directory, exist_ok=True)
