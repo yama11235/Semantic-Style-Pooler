@@ -209,22 +209,12 @@ class CustomTrainer(Trainer):
 
         for head in active_heads:
             objective = self.head_objectives.get(head)
-            if objective is None:
-                continue
+            assert objective is not None, f"Objective for head '{head}' is not defined."
             head_output = outputs.get(head)
-            if head_output is None:
-                continue
-
             prepared = self._prepare_head_batch(batch_active_heads, head, labels, device)
-            if prepared is None:
-                continue
             mask, valid, subset_labels = prepared
-
             filtered_embeddings = head_output[mask]
             filtered_embeddings = filtered_embeddings[valid]
-            if filtered_embeddings.size(0) < 2:
-                continue
-
             filtered_labels = subset_labels[valid]
             head_loss = objective.compute_single(self, filtered_embeddings, filtered_labels)
             loss = self._accumulate_loss(loss, head_loss)
@@ -248,17 +238,10 @@ class CustomTrainer(Trainer):
 
         for head in active_heads:
             objective = self.head_objectives.get(head)
-            if objective is None:
-                continue
+            assert objective is not None, f"Objective for head '{head}' is not defined."
             tensor = outputs.get(head)
-            if tensor is None:
-                continue
-
             prepared = self._prepare_head_batch(batch_active_heads, head, labels, device)
-            if prepared is None:
-                continue
             mask, valid, subset_labels = prepared
-
             filtered_output = tensor[mask]
             filtered_output = filtered_output[valid]
             filtered_labels = subset_labels[valid]
@@ -284,14 +267,9 @@ class CustomTrainer(Trainer):
 
         for head in active_heads:
             objective = self.head_objectives.get(head)
-            if objective is None:
-                continue
-
+            assert objective is not None, f"Objective for head '{head}' is not defined."
             prepared = self._prepare_head_batch(batch_active_heads, head, labels, device)
-            if prepared is None:
-                continue
             mask, valid, subset_labels = prepared
-
             refined_mask = self._apply_valid_to_mask(mask, valid)
             filtered_labels = subset_labels[valid]
             head_loss = objective.compute_triplet(self, outputs, refined_mask, filtered_labels)
@@ -665,6 +643,7 @@ class CustomTrainer(Trainer):
                     if not head_name:
                         continue
                     cfg = self.classifier_configs.get(head_name)
+                    # infoNCE のみ対応
                     if not cfg or cfg.get("objective") != "infoNCE":
                         continue
                     label_value = labels_np[idx]
