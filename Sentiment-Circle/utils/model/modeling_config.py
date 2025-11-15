@@ -2,8 +2,14 @@ import json
 import os
 import torch.nn as nn
 import torch
-from .modeling_classifier import LinearLayer, MLP2Layer, ContrastiveClassifier
-from typing import Dict, List
+from modeling_classifier import (
+    LinearLayer,
+    MLP2Layer,
+    ContrastiveClassifier,
+    GPTClassifier,
+    nGPTClassifier,
+)
+from typing import Dict, List, Optional
 
 class LinearLayerConfig:
     def __init__(
@@ -138,6 +144,71 @@ class ContrastiveClassifierConfig:
         with open(save_path, 'w') as f:
             json.dump(config_dict, f, indent=4)
 
+class GPTBlockClassifierConfig:
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        num_heads: int,
+        dropout: float = 0.1,
+        layer: int = None,
+        base_scale: Optional[float] = None,
+        bias: bool = False,
+        use_ngpt: bool = False,
+        meta: Optional[dict] = None,
+    ):
+        if num_heads is None:
+            raise ValueError("num_heads must be specified for GPT/nGPT classifiers.")
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.layer = layer
+        self.base_scale = base_scale if base_scale is not None else (input_dim ** -0.5)
+        self.bias = bias
+        self.use_ngpt = use_ngpt
+        self.meta = meta or {}
+
+    def to_dict(self):
+        return {
+            'input_dim': self.input_dim,
+            'output_dim': self.output_dim,
+            'num_heads': self.num_heads,
+            'dropout': self.dropout,
+            'layer': self.layer,
+            'base_scale': self.base_scale,
+            'bias': self.bias,
+            'use_ngpt': self.use_ngpt,
+            'meta': self.meta,
+        }
+
+    @classmethod
+    def from_dict(cls, config_dict):
+        return cls(
+            input_dim=config_dict['input_dim'],
+            output_dim=config_dict['output_dim'],
+            num_heads=config_dict['num_heads'],
+            dropout=config_dict['dropout'],
+            layer=config_dict['layer'],
+            base_scale=config_dict.get('base_scale'),
+            bias=config_dict.get('bias', False),
+            use_ngpt=config_dict.get('use_ngpt', False),
+            meta=config_dict.get('meta', {}),
+        )
+
+    def save_pretrained(self, save_path: str, classifier_name: str):
+        config_dict = self.to_dict()
+        config_dict['classifier_name'] = classifier_name
+        block_type = "ngpt_block" if self.use_ngpt else "gpt_block"
+        save_path = os.path.join(
+            save_path,
+            f"{block_type}:{self.layer}_dim:{self.output_dim}",
+            f"{classifier_name}.json",
+        )
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, 'w') as f:
+            json.dump(config_dict, f, indent=4)
+
 def build_classifiers(classifier_configs: dict, model_config) -> (nn.ModuleDict, dict):
     """
     Factory to build classifier modules and their configs.
@@ -158,8 +229,9 @@ def build_classifiers(classifier_configs: dict, model_config) -> (nn.ModuleDict,
         ctype = params.get("type")
         if ctype is None:
             raise ValueError(f"Classifier {name} - 'type' is required in the config.")
+        ctype_key = ctype.lower() if isinstance(ctype, str) else ctype
 
-        if ctype == 'linear':
+        if ctype_key == 'linear':
             cfg = LinearLayerConfig(
                 input_dim=model_config.hidden_size,
                 output_dim=params["output_dim"],
@@ -174,7 +246,7 @@ def build_classifiers(classifier_configs: dict, model_config) -> (nn.ModuleDict,
             )
             module = LinearLayer(cfg)
 
-        elif ctype == 'contrastive_logit':
+        elif ctype_key == 'contrastive_logit':
             cfg = ContrastiveClassifierConfig(
                 input_dim=model_config.hidden_size,
                 intermediate_dim=params["intermediate_dim"],
@@ -190,7 +262,7 @@ def build_classifiers(classifier_configs: dict, model_config) -> (nn.ModuleDict,
             )
             module = ContrastiveClassifier(cfg)
 
-        elif ctype == 'mlp2':
+        elif ctype_key == 'mlp2':
             cfg = MLP2LayerConfig(
                 input_dim=model_config.hidden_size,
                 intermediate_dim=params["intermediate_dim"],
@@ -206,6 +278,33 @@ def build_classifiers(classifier_configs: dict, model_config) -> (nn.ModuleDict,
                 },
             )
             module = MLP2Layer(cfg)
+
+        elif ctype_key in {'gpt', 'ngpt'}:
+            num_heads = params.get("num_heads", getattr(model_config, "num_attention_heads", None))
+            if num_heads is None:
+                raise ValueError(f"Classifier {name} requires 'num_heads' in params or model_config.num_attention_heads.")
+            base_scale = params.get(
+                "base_scale",
+                1.0 / (model_config.hidden_size ** 0.5),
+            )
+            cfg = GPTBlockClassifierConfig(
+                input_dim=model_config.hidden_size,
+                output_dim=params["output_dim"],
+                num_heads=num_heads,
+                dropout=params.get("dropout", 0.1),
+                layer=params.get("layer", model_config.num_hidden_layers - 1),
+                base_scale=base_scale,
+                bias=params.get("bias", False),
+                use_ngpt=(ctype_key == 'ngpt'),
+                meta={
+                    "name": name,
+                    "type": "nGPT" if ctype_key == 'ngpt' else "GPT",
+                    "objective": params.get("objective", "regression"),
+                    "distance": params.get("distance", "cosine"),
+                },
+            )
+            module_cls = nGPTClassifier if ctype_key == 'ngpt' else GPTClassifier
+            module = module_cls(cfg)
 
         else:
             raise ValueError(f"Unknown classifier type: {ctype}")

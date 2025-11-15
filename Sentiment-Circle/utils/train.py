@@ -29,6 +29,7 @@ from transformers.trainer_utils import get_last_checkpoint
 from progress_logger import LogCallback
 from dataset_preprocessing import get_preprocessing_function, parse_dict, batch_get_preprocessing_function
 from model.modeling_utils import DataCollatorForBiEncoder, get_model
+from model.nGPT_model import NGPTWeightNormCallback
 from clf_trainer import CustomTrainer
 from metrics import compute_metrics
 import wandb
@@ -682,6 +683,37 @@ def main():
         for param in model.backbone.parameters():
             param.requires_grad = True
 
+    # --- ここから追加: nGPT 判定 & optimizer 設定補正 -------------------
+    use_ngpt_riemann = bool(getattr(model, "use_ngpt_blocks", False))
+    if use_ngpt_riemann:
+        logger.info(
+            "nGPT-style classifier detected (model.use_ngpt_blocks=True). "
+            "Enabling pseudo-Riemann weight normalization and nGPT-friendly optimizer settings."
+        )
+        # nGPT 元コードにならって weight_decay=0, warmup なしに寄せる
+        if training_args.weight_decay != 0.0:
+            logger.warning(
+                f"Overriding weight_decay from {training_args.weight_decay} to 0.0 for nGPT."
+            )
+            training_args.weight_decay = 0.0
+
+        if getattr(training_args, "warmup_steps", 0) != 0:
+            logger.warning(
+                f"Overriding warmup_steps from {training_args.warmup_steps} to 0 for nGPT."
+            )
+            training_args.warmup_steps = 0
+
+        if getattr(training_args, "warmup_ratio", 0.0) != 0.0:
+            logger.warning(
+                f"Overriding warmup_ratio from {training_args.warmup_ratio} to 0.0 for nGPT."
+            )
+            training_args.warmup_ratio = 0.0
+    else:
+        logger.info(
+            "No nGPT-style classifier detected (model.use_ngpt_blocks=False). "
+            "Training will use standard optimizer settings without Riemann projection."
+        )
+
     logger.debug("Model architecture: %s", model)
     # Padding strategy
     if data_args.pad_to_max_length:
@@ -812,6 +844,7 @@ def main():
             embedding_eval_mode=embedding_mode,
         )
     
+    ngpt_callback = NGPTWeightNormCallback(enabled=use_ngpt_riemann)
     trainer = CustomTrainer(
         model=model,
         args=training_args,
@@ -821,7 +854,7 @@ def main():
         eval_dataset=eval_dataset if training_args.do_eval else None,
         compute_metrics=compute_fn,
         tokenizer=tokenizer,
-        callbacks=[LogCallback],
+        callbacks=[LogCallback, ngpt_callback],
         dtype=collator_dtype,
         corr_labels=corr_labels,
         corr_weights=corr_weights,
@@ -831,7 +864,7 @@ def main():
     trainer_state["trainer"] = trainer
     
     trainer.remove_callback(PrinterCallback)
-    trainer.add_callback(LogCallback)
+    
     if training_args.do_train:
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:

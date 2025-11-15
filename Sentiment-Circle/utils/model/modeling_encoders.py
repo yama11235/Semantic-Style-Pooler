@@ -6,10 +6,11 @@ import torch.nn.functional as F
 
 from transformers import PreTrainedModel, AutoModel
 import logging
-from .modeling_config import (
+from modeling_config import (
     build_classifiers,
     load_classifiers
 )
+from nGPT_model import justnorm, _is_ngpt_block, _normalize_single_ngpt_block
 import os
 from sentence_batch_utils import BatchPartitioner
 from contextlib import nullcontext
@@ -436,6 +437,11 @@ class BiEncoderForClassification(PreTrainedModel):
             # # 出力のdtype
             # print("出力のdtype:", output.dtype if isinstance(output, torch.Tensor) else type(output))
 
+        # --- nGPT-style Block の有無を検出して初期正規化 ------------------
+        self.use_ngpt_blocks = self._detect_ngpt_blocks()
+        if self.use_ngpt_blocks:
+            logger.info("Detected nGPT-style classifier block(s); applying initial weight normalization.")
+            self.normalize_ngpt_matrices()
 
     def _get_classifier_strategy(self, classifier_type: str) -> _ClassifierStrategy:
         return self._classifier_strategies.get(classifier_type, self._default_classifier_strategy)
@@ -784,3 +790,28 @@ class BiEncoderForClassification(PreTrainedModel):
             model.embedding_classifiers = loaded_heads
 
         return model
+
+
+    def _detect_ngpt_blocks(self) -> bool:
+        """
+        embedding_classifiers のどこかに use_nGPT=1 の Block があれば True。
+        backbone (BERT 本体) には触らない。
+        """
+        for _, clf in self.embedding_classifiers.items():
+            for module in clf.modules():
+                if _is_ngpt_block(module):
+                    return True
+        return False
+
+    def normalize_ngpt_matrices(self) -> None:
+        """
+        use_nGPT=1 な classifier Block のパラメータを nGPT 方式で L2 正規化する。
+        - 初期化時に 1 回
+        - train.py から optimizer.step() ごとに呼び出される
+        """
+        if not getattr(self, "use_ngpt_blocks", False):
+            return
+        for _, clf in self.embedding_classifiers.items():
+            for module in clf.modules():
+                if _is_ngpt_block(module):
+                    _normalize_single_ngpt_block(module)
