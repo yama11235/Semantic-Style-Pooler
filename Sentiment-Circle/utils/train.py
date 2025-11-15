@@ -28,7 +28,7 @@ from transformers.trainer_utils import get_last_checkpoint
 
 from progress_logger import LogCallback
 from dataset_preprocessing import get_preprocessing_function, parse_dict, batch_get_preprocessing_function
-from modeling_utils import DataCollatorForBiEncoder, get_model
+from model.modeling_utils import DataCollatorForBiEncoder, get_model
 from clf_trainer import CustomTrainer
 from metrics import compute_metrics
 import wandb

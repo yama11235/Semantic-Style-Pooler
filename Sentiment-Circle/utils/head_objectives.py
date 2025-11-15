@@ -7,6 +7,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from loss_function import compute_info_nce_loss
+
 
 class HeadObjective(ABC):
     """Base class providing a uniform interface for head-specific losses."""
@@ -59,7 +61,7 @@ class InfoNCEObjective(HeadObjective):
         if embeddings.numel() == 0:
             return None
         tau = max(self.tau, 1e-6)
-        return trainer._compute_info_nce_loss(
+        return compute_info_nce_loss(
             embeddings=embeddings,
             labels=labels.long(),
             tau=tau,

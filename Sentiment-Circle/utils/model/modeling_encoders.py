@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from transformers import PreTrainedModel, AutoModel
 import logging
-from modeling_config import (
+from .modeling_config import (
     build_classifiers,
     load_classifiers
 )
