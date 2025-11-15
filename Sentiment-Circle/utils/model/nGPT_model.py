@@ -42,6 +42,12 @@ from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
 from transformers import TrainerCallback
 
 
+def justnorm(tensor: torch.Tensor, dim: int, eps: float = 1e-12) -> torch.Tensor:
+    """Return the L2-normalized tensor along the specified dimension."""
+    denom = tensor.norm(p=2, dim=dim, keepdim=True).clamp_min(eps)
+    return tensor / denom
+
+
 def apply_rotary_position_embeddings(sinusoidal_pos, q, k):
     # Split the sinusoidal_pos into sin and cos parts
     sin, cos = sinusoidal_pos.chunk(2, dim=-1)
@@ -157,10 +163,9 @@ class Block(nn.Module):
             self.suv = torch.nn.Parameter(self.suv_init_scaling*torch.ones(2 * 4 * config.n_embd, dtype=torch.float32))
 
     
-    def justnorm(self, x):
-        #return F.normalize(x, p=2, dim=-1)
-        res = x / x.norm(p=2, dim=-1, keepdim=True)
-        return res
+    @staticmethod
+    def justnorm(x: torch.Tensor) -> torch.Tensor:
+        return justnorm(x, dim=-1)
 
     def forward(self, h):
         B, T, C = h.size()
