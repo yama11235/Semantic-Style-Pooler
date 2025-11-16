@@ -112,10 +112,7 @@ class _GPTBlockClassifierBase(nn.Module):
         )
         # iblock is unused inside Block, so we can fix it at 0.
         self.transformer = Block(block_config, iblock=0)
-        self.projection = nn.Sequential(
-            self.transformer,
-            nn.Linear(config.input_dim, config.output_dim),
-        )
+        self.output_projection = nn.Linear(config.input_dim, config.output_dim)
 
     def _ensure_sequence_dim(self, embedding: torch.Tensor) -> torch.Tensor:
         if embedding.dim() == 2:
@@ -127,7 +124,9 @@ class _GPTBlockClassifierBase(nn.Module):
         )
 
     def forward(self, embedding: torch.Tensor) -> torch.Tensor:
-        return self.projection(self._ensure_sequence_dim(embedding)).squeeze(1)
+        sequence = self._ensure_sequence_dim(embedding)
+        transformed = self.transformer(sequence)
+        return self.output_projection(transformed)
 
     def encode(self, embedding: torch.Tensor) -> torch.Tensor:
         return self.forward(embedding)

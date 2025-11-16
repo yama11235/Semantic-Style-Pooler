@@ -6,10 +6,12 @@ import torch.nn.functional as F
 
 from transformers import PreTrainedModel, AutoModel
 import logging
+from types import SimpleNamespace
 from .modeling_config import (
     build_classifiers,
     load_classifiers
 )
+from .modeling_classifier import GPTClassifier, nGPTClassifier
 from .nGPT_model import justnorm, _is_ngpt_block, _normalize_single_ngpt_block
 import os
 from utils.sentence_batch_utils import BatchPartitioner
@@ -186,6 +188,36 @@ class BiEncoderForClassification(PreTrainedModel):
         pooled = self.pooler(attention_mask, outputs, layer)
         return self._split_by_batch(pooled, batch_sizes)
 
+    def _get_sequence_features(
+        self,
+        outputs,
+        batch_sizes: list[int],
+        target_layer: int | None = None,
+    ) -> list[torch.Tensor]:
+        if outputs.hidden_states is None:
+            raise ValueError("Hidden states are required for GPT/nGPT classifiers but were not returned by the backbone.")
+        layer = target_layer if target_layer is not None else -1
+        hidden = outputs.hidden_states[layer]
+        return self._split_by_batch(hidden, batch_sizes)
+
+    def _split_attention_masks(
+        self,
+        attention_mask: torch.Tensor,
+        batch_sizes: list[int],
+    ) -> list[torch.Tensor]:
+        return self._split_by_batch(attention_mask, batch_sizes)
+
+    def _pool_classifier_output(
+        self,
+        attention_mask: torch.Tensor,
+        classifier_output: torch.Tensor,
+    ) -> torch.Tensor:
+        pseudo_outputs = SimpleNamespace(
+            last_hidden_state=classifier_output,
+            hidden_states=(classifier_output, classifier_output),
+        )
+        return self.pooler(attention_mask, pseudo_outputs, target_layer=-1)
+
     def _apply_classifiers(
         self,
         attention_mask: torch.Tensor,
@@ -197,9 +229,17 @@ class BiEncoderForClassification(PreTrainedModel):
             return {}
 
         results = {}
+        mask_splits = self._split_attention_masks(attention_mask, batch_sizes)
         for name, classifier in self.embedding_classifiers.items():
             target_layer = int(self.classifier_configs[name]["layer"])
-            features = self._pool_and_split(attention_mask, outputs, batch_sizes, target_layer)
+            if isinstance(classifier, (GPTClassifier, nGPTClassifier)):
+                sequence_features = self._get_sequence_features(outputs, batch_sizes, target_layer)
+                features = [
+                    self._pool_classifier_output(mask, classifier(seq_feature))
+                    for seq_feature, mask in zip(sequence_features, mask_splits)
+                ]
+            else:
+                features = self._pool_and_split(attention_mask, outputs, batch_sizes, target_layer)
             strategy = self._get_classifier_strategy(self.classifier_configs[name]["type"])
             handler = getattr(strategy, mode)
             results.update(handler(self, name, classifier, features))
