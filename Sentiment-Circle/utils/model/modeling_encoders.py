@@ -124,17 +124,6 @@ class BiEncoderForClassification(PreTrainedModel):
         for name, classifier in self.embedding_classifiers.items():
             classifier.to(device=backbone_device)
             classifier.to(dtype=next(self.backbone.parameters()).dtype)
-            # # ダミー入力（バッチサイズ1, 入力次元2560、backboneと同じdevice・分類器のdtypeで作成）
-            dummy_input = torch.randn(1, 1024, device=backbone_device, dtype=next(classifier.parameters()).dtype)
-
-            # # 入力のdtype
-            # print("入力のdtype:", dummy_input.dtype)
-
-            # # 出力を得る
-            output = classifier(dummy_input)
-
-            # # 出力のdtype
-            # print("出力のdtype:", output.dtype if isinstance(output, torch.Tensor) else type(output))
 
         # --- nGPT-style Block の有無を検出して初期正規化 ------------------
         self.use_ngpt_blocks = self._detect_ngpt_blocks()

@@ -111,7 +111,11 @@ class _GPTBlockClassifierBase(nn.Module):
             bias=config.bias,
         )
         # iblock is unused inside Block, so we can fix it at 0.
-        self.projection = Block(block_config, iblock=0)
+        self.transformer = Block(block_config, iblock=0)
+        self.projection = nn.Sequential(
+            self.transformer,
+            nn.Linear(config.input_dim, config.output_dim),
+        )
 
     def _ensure_sequence_dim(self, embedding: torch.Tensor) -> torch.Tensor:
         if embedding.dim() == 2:

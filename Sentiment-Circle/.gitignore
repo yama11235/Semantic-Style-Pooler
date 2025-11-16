@@ -1,0 +1,3 @@
+outputs
+utils/__pycache__/
+utils/wandb/
