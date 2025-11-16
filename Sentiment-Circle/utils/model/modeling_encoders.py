@@ -6,12 +6,10 @@ import torch.nn.functional as F
 
 from transformers import PreTrainedModel, AutoModel
 import logging
-from types import SimpleNamespace
 from .modeling_config import (
     build_classifiers,
     load_classifiers
 )
-from .modeling_classifier import GPTClassifier, nGPTClassifier
 from .nGPT_model import justnorm, _is_ngpt_block, _normalize_single_ngpt_block
 import os
 from utils.sentence_batch_utils import BatchPartitioner
@@ -207,17 +205,6 @@ class BiEncoderForClassification(PreTrainedModel):
     ) -> list[torch.Tensor]:
         return self._split_by_batch(attention_mask, batch_sizes)
 
-    def _pool_classifier_output(
-        self,
-        attention_mask: torch.Tensor,
-        classifier_output: torch.Tensor,
-    ) -> torch.Tensor:
-        pseudo_outputs = SimpleNamespace(
-            last_hidden_state=classifier_output,
-            hidden_states=(classifier_output, classifier_output),
-        )
-        return self.pooler(attention_mask, pseudo_outputs, target_layer=-1)
-
     def _apply_classifiers(
         self,
         attention_mask: torch.Tensor,
@@ -232,14 +219,11 @@ class BiEncoderForClassification(PreTrainedModel):
         mask_splits = self._split_attention_masks(attention_mask, batch_sizes)
         for name, classifier in self.embedding_classifiers.items():
             target_layer = int(self.classifier_configs[name]["layer"])
-            if isinstance(classifier, (GPTClassifier, nGPTClassifier)):
-                sequence_features = self._get_sequence_features(outputs, batch_sizes, target_layer)
-                features = [
-                    self._pool_classifier_output(mask, classifier(seq_feature))
-                    for seq_feature, mask in zip(sequence_features, mask_splits)
-                ]
-            else:
-                features = self._pool_and_split(attention_mask, outputs, batch_sizes, target_layer)
+            sequence_features = self._get_sequence_features(outputs, batch_sizes, target_layer)
+            features = [
+                (seq_feature, mask)
+                for seq_feature, mask in zip(sequence_features, mask_splits)
+            ]
             strategy = self._get_classifier_strategy(self.classifier_configs[name]["type"])
             handler = getattr(strategy, mode)
             results.update(handler(self, name, classifier, features))
@@ -484,7 +468,8 @@ class BiEncoderForClassification(PreTrainedModel):
         self.config.save_pretrained(model_save_directory)
         # 各分類器の保存
         for name, module in self.embedding_classifiers.items():
-            param_str = f"{self.classifier_configs[name]['type']}_layer:{self.classifier_configs[name]['layer']}_dim:{self.classifier_configs[name]['output_dim']}"
+            dim_value = self.classifier_configs[name].get('output_dim', self.config.hidden_size)
+            param_str = f"{self.classifier_configs[name]['type']}_layer:{self.classifier_configs[name]['layer']}_dim:{dim_value}"
             save_path = os.path.join(classifier_save_directory, param_str,f"{name}_classifier.bin")
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(module.state_dict(), save_path)
