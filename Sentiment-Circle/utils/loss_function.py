@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from sentence_batch_utils import flatten_strings
+from utils.sentence_batch_utils import flatten_strings
 
 TensorDict = Dict[str, torch.Tensor]
 LossResult = Tuple[Optional[torch.Tensor], TensorDict]

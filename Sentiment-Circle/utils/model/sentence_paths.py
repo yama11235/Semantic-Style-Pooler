@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
-from sentence_batch_utils import BatchPartitioner
+from utils.sentence_batch_utils import BatchPartitioner
 
 if TYPE_CHECKING:  # pragma: no cover
     from modeling_encoders import BiEncoderForClassification

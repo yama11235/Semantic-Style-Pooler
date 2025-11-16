@@ -2,7 +2,7 @@ from torch import nn
 import torch
 from types import SimpleNamespace
 
-from nGPT_model import Block
+from .nGPT_model import Block
 
 class LinearLayer(nn.Module):
     def __init__(self, config):

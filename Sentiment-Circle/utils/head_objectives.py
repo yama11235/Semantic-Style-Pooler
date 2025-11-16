@@ -7,7 +7,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from loss_function import compute_info_nce_loss
+from utils.loss_function import compute_info_nce_loss
 
 
 class HeadObjective(ABC):
