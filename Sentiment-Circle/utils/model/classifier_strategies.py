@@ -105,19 +105,25 @@ class _ClassifierStrategy:
 
 class _DefaultClassifierStrategy(_ClassifierStrategy):
     def single(self, model, name, classifier, features):
-        embedding = classifier.encode(features[0]).to(features[0].dtype)
+        seq, mask = features[0]
+        embedding = classifier.encode(seq, mask).to(seq.dtype)
         return {name: embedding}
 
     def pair(self, model, name, classifier, features):
-        output1 = classifier(features[0])
-        output2 = classifier(features[1])
+        seq1, mask1 = features[0]
+        seq2, mask2 = features[1]
+        output1 = classifier(seq1, mask1)
+        output2 = classifier(seq2, mask2)
         similarity = calculate_similarity(name, output1, output2, model.classifier_configs)
         return {name: similarity}
 
     def triplet(self, model, name, classifier, features):
-        output1 = classifier(features[0])
-        output2 = classifier(features[1])
-        output3 = classifier(features[2])
+        seq1, mask1 = features[0]
+        seq2, mask2 = features[1]
+        seq3, mask3 = features[2]
+        output1 = classifier(seq1, mask1)
+        output2 = classifier(seq2, mask2)
+        output3 = classifier(seq3, mask3)
         pos_similarity, neg_similarity = calculate_pos_neg_similarity(
             name, output1, output2, output3, model.classifier_configs
         )
@@ -129,19 +135,25 @@ class _DefaultClassifierStrategy(_ClassifierStrategy):
 
 class _ContrastiveLogitStrategy(_ClassifierStrategy):
     def single(self, model, name, classifier, features):
-        embedding = classifier.encode(features[0]).to(features[0].dtype)
+        seq, mask = features[0]
+        embedding = classifier.encode(seq, mask).to(seq.dtype)
         return {name: embedding}
 
     def pair(self, model, name, classifier, features):
-        output1 = classifier.encode(features[0])
-        output2 = classifier.encode(features[1])
+        seq1, mask1 = features[0]
+        seq2, mask2 = features[1]
+        output1 = classifier.encode(seq1, mask1)
+        output2 = classifier.encode(seq2, mask2)
         similarity = calculate_similarity(name, output1, output2, model.classifier_configs)
         return {name: similarity}
 
     def triplet(self, model, name, classifier, features):
-        output1, prob1 = classifier(features[0])
-        output2, prob2 = classifier(features[1])
-        output3, prob3 = classifier(features[2])
+        seq1, mask1 = features[0]
+        seq2, mask2 = features[1]
+        seq3, mask3 = features[2]
+        output1, prob1 = classifier(seq1, mask1)
+        output2, prob2 = classifier(seq2, mask2)
+        output3, prob3 = classifier(seq3, mask3)
         pos_similarity, neg_similarity = calculate_pos_neg_similarity(
             name, output1, output2, output3, model.classifier_configs
         )
@@ -154,5 +166,6 @@ class _ContrastiveLogitStrategy(_ClassifierStrategy):
         }
 
     def classify(self, model, name, classifier, features):
-        _, prob = classifier(features[0])
+        seq, mask = features[0]
+        _, prob = classifier(seq, mask)
         return {f"{name}_prob": prob}

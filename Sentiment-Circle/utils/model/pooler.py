@@ -25,8 +25,13 @@ class Pooler(nn.Module):
         ], f"unrecognized pooling type {self.pooler_type}"
 
     def forward(self, attention_mask: torch.Tensor, outputs, target_layer: int = -1):
-        last_hidden = outputs.last_hidden_state
-        hidden_states = outputs.hidden_states
+        if isinstance(outputs, torch.Tensor):
+            last_hidden = outputs
+            hidden_states = (outputs,)
+        else:
+            last_hidden = outputs.last_hidden_state
+            hidden_states = outputs.hidden_states or (last_hidden,)
+
         dtype = last_hidden.dtype
 
         if self.pooler_type in ["cls_before_pooler", "cls"]:

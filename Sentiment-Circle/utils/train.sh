@@ -34,6 +34,7 @@ cat <<JSON >"${CONFIG_PATH}"
     "layer": -1,
     "objective": "infoNCE",
     "distance": "cosine",
+    "pooler_type": "${POOLER_TYPE}",
     "output_dim": 256,
     "dropout": 0.1,
     "tau": ${TAU},

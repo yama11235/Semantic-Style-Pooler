@@ -16,29 +16,33 @@ class LinearLayerConfig:
         self,
         input_dim: int,
         output_dim: int,
+        pooler_type: str,
         dropout: float = 0.1,
         layer: int = None,
         meta: dict = None,
     ):
         self.input_dim = input_dim
         self.output_dim = output_dim
+        self.pooler_type = pooler_type
         self.dropout = dropout
         self.layer = layer
         self.meta = meta or {}
-        
+
     def to_dict(self):
         return {
             'input_dim': self.input_dim,
             'output_dim': self.output_dim,
+            'pooler_type': self.pooler_type,
             'dropout': self.dropout,
             'layer': self.layer,
             'meta': self.meta,
         }
-    
+
     @classmethod
     def from_dict(cls, config_dict):
         return cls(
             output_dim=config_dict['output_dim'],
+            pooler_type=config_dict['pooler_type'],
             dropout=config_dict['dropout'],
             meta=config_dict.get('meta', {}),
         )
@@ -58,35 +62,39 @@ class MLP2LayerConfig:
         intermediate_dim: int,
         bottleneck_dim: int,
         output_dim: int,
+        pooler_type: str,
         dropout: float = 0.1,
         layer: int = None,
         meta: dict = None,
-    ):  
+    ):
         self.input_dim = input_dim
         self.intermediate_dim = intermediate_dim
         self.bottleneck_dim = bottleneck_dim
         self.output_dim = output_dim
+        self.pooler_type = pooler_type
         self.dropout = dropout
         self.layer = layer
         self.meta = meta or {}
-    
+
     def to_dict(self):
         return {
             'input_dim': self.input_dim,
             'intermediate_dim': self.intermediate_dim,
             'bottleneck_dim': self.bottleneck_dim,
             'output_dim': self.output_dim,
+            'pooler_type': self.pooler_type,
             'dropout': self.dropout,
             'layer': self.layer,
             'meta': self.meta,
         }
-    
+
     @classmethod
     def from_dict(cls, config_dict):
         return cls(
             intermediate_dim=config_dict['intermediate_dim'],
             bottleneck_dim=config_dict['bottleneck_dim'],
             output_dim=config_dict['output_dim'],
+            pooler_type=config_dict['pooler_type'],
             dropout=config_dict['dropout'],
             meta=config_dict.get('meta', {}),
         )
@@ -105,6 +113,7 @@ class ContrastiveClassifierConfig:
         input_dim: int,
         intermediate_dim: int,
         output_dim: int,
+        pooler_type: str,
         dropout: float = 0.1,
         layer: int = None,
         meta: dict = None,
@@ -112,26 +121,29 @@ class ContrastiveClassifierConfig:
         self.input_dim = input_dim
         self.intermediate_dim = intermediate_dim
         self.output_dim = output_dim
+        self.pooler_type = pooler_type
         self.dropout = dropout
         self.layer = layer
         self.meta = meta or {}
-        
+
     def to_dict(self):
         return {
             'input_dim': self.input_dim,
             'intermediate_dim': self.intermediate_dim,
             'output_dim': self.output_dim,
+            'pooler_type': self.pooler_type,
             'dropout': self.dropout,
             'layer': self.layer,
             'meta': self.meta,
         }
-    
+
     @classmethod
     def from_dict(cls, config_dict):
         return cls(
             input_dim=config_dict['input_dim'],
             intermediate_dim=config_dict['intermediate_dim'],
             output_dim=config_dict['output_dim'],
+            pooler_type=config_dict['pooler_type'],
             dropout=config_dict['dropout'],
             meta=config_dict.get('meta', {}),
         )
@@ -148,8 +160,8 @@ class GPTBlockClassifierConfig:
     def __init__(
         self,
         input_dim: int,
-        output_dim: int,
         num_heads: int,
+        pooler_type: str,
         dropout: float = 0.1,
         layer: int = None,
         base_scale: Optional[float] = None,
@@ -160,8 +172,8 @@ class GPTBlockClassifierConfig:
         if num_heads is None:
             raise ValueError("num_heads must be specified for GPT/nGPT classifiers.")
         self.input_dim = input_dim
-        self.output_dim = output_dim
         self.num_heads = num_heads
+        self.pooler_type = pooler_type
         self.dropout = dropout
         self.layer = layer
         self.base_scale = base_scale if base_scale is not None else (input_dim ** -0.5)
@@ -172,8 +184,8 @@ class GPTBlockClassifierConfig:
     def to_dict(self):
         return {
             'input_dim': self.input_dim,
-            'output_dim': self.output_dim,
             'num_heads': self.num_heads,
+            'pooler_type': self.pooler_type,
             'dropout': self.dropout,
             'layer': self.layer,
             'base_scale': self.base_scale,
@@ -186,8 +198,8 @@ class GPTBlockClassifierConfig:
     def from_dict(cls, config_dict):
         return cls(
             input_dim=config_dict['input_dim'],
-            output_dim=config_dict['output_dim'],
             num_heads=config_dict['num_heads'],
+            pooler_type=config_dict['pooler_type'],
             dropout=config_dict['dropout'],
             layer=config_dict['layer'],
             base_scale=config_dict.get('base_scale'),
@@ -202,7 +214,7 @@ class GPTBlockClassifierConfig:
         block_type = "ngpt_block" if self.use_ngpt else "gpt_block"
         save_path = os.path.join(
             save_path,
-            f"{block_type}:{self.layer}_dim:{self.output_dim}",
+            f"{block_type}:{self.layer}_dim:{self.input_dim}",
             f"{classifier_name}.json",
         )
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -235,6 +247,7 @@ def build_classifiers(classifier_configs: dict, model_config) -> (nn.ModuleDict,
             cfg = LinearLayerConfig(
                 input_dim=model_config.hidden_size,
                 output_dim=params["output_dim"],
+                pooler_type=params.get("pooler_type", model_config.pooler_type),
                 dropout=params.get("dropout", 0.1),
                 layer=params.get("layer", model_config.num_hidden_layers - 1),
                 meta={
@@ -251,6 +264,7 @@ def build_classifiers(classifier_configs: dict, model_config) -> (nn.ModuleDict,
                 input_dim=model_config.hidden_size,
                 intermediate_dim=params["intermediate_dim"],
                 output_dim=params["output_dim"],
+                pooler_type=params.get("pooler_type", model_config.pooler_type),
                 dropout=params.get("dropout", 0.1),
                 layer=params.get("layer", model_config.num_hidden_layers - 1),
                 meta={
@@ -268,6 +282,7 @@ def build_classifiers(classifier_configs: dict, model_config) -> (nn.ModuleDict,
                 intermediate_dim=params["intermediate_dim"],
                 bottleneck_dim=params["bottleneck_dim"],
                 output_dim=params["output_dim"],
+                pooler_type=params.get("pooler_type", model_config.pooler_type),
                 dropout=params.get("dropout", 0.1),
                 layer=params.get("layer", model_config.num_hidden_layers - 1),
                 meta={
@@ -289,8 +304,8 @@ def build_classifiers(classifier_configs: dict, model_config) -> (nn.ModuleDict,
             )
             cfg = GPTBlockClassifierConfig(
                 input_dim=model_config.hidden_size,
-                output_dim=params["output_dim"],
                 num_heads=num_heads,
+                pooler_type=params.get("pooler_type", model_config.pooler_type),
                 dropout=params.get("dropout", 0.1),
                 layer=params.get("layer", model_config.num_hidden_layers - 1),
                 base_scale=base_scale,
