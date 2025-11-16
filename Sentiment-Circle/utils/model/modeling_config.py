@@ -2,7 +2,7 @@ import json
 import os
 import torch.nn as nn
 import torch
-from modeling_classifier import (
+from .modeling_classifier import (
     LinearLayer,
     MLP2Layer,
     ContrastiveClassifier,

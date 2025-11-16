@@ -6,11 +6,18 @@ Author: Ameet Deshpande, Carlos E. Jimenez
 import json
 import logging
 import os
+from pathlib import Path
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["WANDB_API_KEY"] = "11c77110ad8d01487f0db6c65c034f66aaa6841b"
 import random
 import sys
+
+if __package__ is None or __package__ == "":
+    current_dir = Path(__file__).resolve().parent
+    parent_dir = current_dir.parent
+    sys.path.insert(0, str(parent_dir))
+    __package__ = "utils"
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -26,12 +33,16 @@ from transformers import (
 from transformers import TrainingArguments as HFTrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
 
-from progress_logger import LogCallback
-from dataset_preprocessing import get_preprocessing_function, parse_dict, batch_get_preprocessing_function
-from model.modeling_utils import DataCollatorForBiEncoder, get_model
-from model.nGPT_model import NGPTWeightNormCallback
-from clf_trainer import CustomTrainer
-from metrics import compute_metrics
+from utils.progress_logger import LogCallback
+from utils.dataset_preprocessing import (
+    get_preprocessing_function,
+    parse_dict,
+    batch_get_preprocessing_function,
+)
+from utils.model.modeling_utils import DataCollatorForBiEncoder, get_model
+from utils.model.nGPT_model import NGPTWeightNormCallback
+from utils.clf_trainer import CustomTrainer
+from utils.metrics import compute_metrics
 import wandb
 import torch
 from datasets import concatenate_datasets, DatasetDict

@@ -6,22 +6,22 @@ import torch.nn.functional as F
 
 from transformers import PreTrainedModel, AutoModel
 import logging
-from modeling_config import (
+from .modeling_config import (
     build_classifiers,
     load_classifiers
 )
-from nGPT_model import justnorm, _is_ngpt_block, _normalize_single_ngpt_block
+from .nGPT_model import justnorm, _is_ngpt_block, _normalize_single_ngpt_block
 import os
-from sentence_batch_utils import BatchPartitioner
+from utils.sentence_batch_utils import BatchPartitioner
 from contextlib import nullcontext
 
-from classifier_strategies import (
+from .classifier_strategies import (
     _ClassifierStrategy,
     _ContrastiveLogitStrategy,
     _DefaultClassifierStrategy,
 )
-from pooler import Pooler
-from sentence_paths import (
+from .pooler import Pooler
+from .sentence_paths import (
     PairSentencePath,
     SingleSentencePath,
     TripletSentencePath,

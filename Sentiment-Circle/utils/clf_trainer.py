@@ -7,12 +7,12 @@ from transformers import Trainer
 
 from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict
-from sentence_batch_utils import (
+from utils.sentence_batch_utils import (
     BatchPartitioner,
     extract_unique_strings,
     flatten_strings,
 )
-from head_objectives import (
+from utils.head_objectives import (
     AngleNCEObjective,
     BinaryClassificationObjective,
     ContrastiveLogitObjective,
@@ -21,7 +21,7 @@ from head_objectives import (
     RegressionObjective,
 )
 
-from loss_function import (
+from utils.loss_function import (
     compute_pair_correlation_penalty,
     compute_pair_loss,
     compute_single_loss,
@@ -29,7 +29,7 @@ from loss_function import (
     compute_triplet_loss,
     fill_missing_output_keys,
 )
-from plot_2D import plot_tsne_embedding_space
+from utils.plot_2D import plot_tsne_embedding_space
 
 def pearsonr_torch(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """

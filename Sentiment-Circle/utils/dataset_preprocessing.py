@@ -2,7 +2,7 @@ import ast
 import argparse
 from typing import Any, Dict, List
 
-from sentence_batch_utils import tokenize_optional_sentences
+from utils.sentence_batch_utils import tokenize_optional_sentences
 
 def scale_to_range(labels, _min, _max):
     return list(map(lambda x: (x - _min) / (_max - _min), labels))
