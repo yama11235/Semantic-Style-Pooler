@@ -16,10 +16,7 @@ class Pooler(nn.Module):
         self.pooler_type = pooler_type
         assert self.pooler_type in [
             "cls",
-            "cls_before_pooler",
             "avg",
-            "avg_top2",
-            "avg_first_last",
             "last",
             "max",
         ], f"unrecognized pooling type {self.pooler_type}"
@@ -34,7 +31,7 @@ class Pooler(nn.Module):
 
         dtype = last_hidden.dtype
 
-        if self.pooler_type in ["cls_before_pooler", "cls"]:
+        if self.pooler_type in ["cls"]:
             return last_hidden[:, 0]
         if self.pooler_type == "avg":
             return (
@@ -47,20 +44,6 @@ class Pooler(nn.Module):
                 ~mask, torch.finfo(hidden_states[target_layer].dtype).min
             )
             pooled_result, _ = masked_hidden.max(dim=1)
-            return pooled_result.to(dtype)
-        if self.pooler_type == "avg_first_last":
-            first_hidden = hidden_states[0]
-            last_hidden = hidden_states[-1]
-            pooled_result = (
-                (first_hidden + last_hidden) / 2.0 * attention_mask.unsqueeze(-1)
-            ).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
-            return pooled_result.to(dtype)
-        if self.pooler_type == "avg_top2":
-            second_last_hidden = hidden_states[-2]
-            last_hidden = hidden_states[-1]
-            pooled_result = (
-                (last_hidden + second_last_hidden) / 2.0 * attention_mask.unsqueeze(-1)
-            ).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
             return pooled_result.to(dtype)
         if self.pooler_type == "last":
             lengths = attention_mask.sum(dim=1) - 1

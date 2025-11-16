@@ -251,15 +251,6 @@ class ModelArguments:
             3) tri_encoder: Tri-encoder model."
         },
     )
-    # Pooler for bi-encoder
-    pooler_type: Optional[str] = field(
-        default="avg",
-        metadata={
-            "help": "Pooler type: Options:\
-            1) cls: Use [CLS] token.\
-            2) avg: Mean pooling."
-        },
-    )
     freeze_encoder: Optional[bool] = field(
         default=False, metadata={"help": "Freeze encoder weights."}
     )
@@ -678,7 +669,6 @@ def main():
             "model_revision": model_args.model_revision,
             "cache_dir": model_args.cache_dir,
             "model_name_or_path": model_args.model_name_or_path,
-            "pooler_type": model_args.pooler_type,
             "transform": model_args.transform,
             "attn_implementation": model_args.use_flash_attention,
             "device_map": model_args.device_map,

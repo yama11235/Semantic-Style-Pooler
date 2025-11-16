@@ -132,7 +132,6 @@ class _GPTBlockClassifierBase(nn.Module):
 
         pooler_type = config.pooler_type
         self.pooler = Pooler(pooler_type)
-        setattr(self, pooler_type, self.pooler)
 
     def _ensure_sequence_dim(self, embedding: torch.Tensor) -> torch.Tensor:
         if embedding.dim() == 2:

@@ -23,7 +23,7 @@ SEED=${SEED:-42}
 FP16=${FP16:-false}
 BF16=${BF16:-false}
 FREEZE_ENCODER=${FREEZE_ENCODER:-true}
-OUTPUT_DIR="${OUTPUT_ROOT}/sentiment_info_nce"
+OUTPUT_DIR="${OUTPUT_ROOT}/sentiment_test"
 mkdir -p "${OUTPUT_DIR}"
 
 CONFIG_PATH="${OUTPUT_DIR}/classifier_config.json"

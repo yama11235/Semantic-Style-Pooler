@@ -68,7 +68,6 @@ def calculate_pos_neg_similarity(
 class _ClassifierStrategy:
     def single(
         self,
-        model: "BiEncoderForClassification",
         name: str,
         classifier: nn.Module,
         features: List[torch.Tensor],
@@ -77,7 +76,6 @@ class _ClassifierStrategy:
 
     def pair(
         self,
-        model: "BiEncoderForClassification",
         name: str,
         classifier: nn.Module,
         features: List[torch.Tensor],
@@ -86,7 +84,6 @@ class _ClassifierStrategy:
 
     def triplet(
         self,
-        model: "BiEncoderForClassification",
         name: str,
         classifier: nn.Module,
         features: List[torch.Tensor],
@@ -95,7 +92,6 @@ class _ClassifierStrategy:
 
     def classify(
         self,
-        model: "BiEncoderForClassification",
         name: str,
         classifier: nn.Module,
         features: List[torch.Tensor],
@@ -104,10 +100,10 @@ class _ClassifierStrategy:
 
 
 class _DefaultClassifierStrategy(_ClassifierStrategy):
-    def single(self, model, name, classifier, features):
+    def single(self, name, classifier, features):
         seq, mask = features[0]
         embedding = classifier.encode(seq, mask).to(seq.dtype)
-        return {name: embedding}
+        return embedding
 
     def pair(self, model, name, classifier, features):
         seq1, mask1 = features[0]
@@ -115,7 +111,7 @@ class _DefaultClassifierStrategy(_ClassifierStrategy):
         output1 = classifier(seq1, mask1)
         output2 = classifier(seq2, mask2)
         similarity = calculate_similarity(name, output1, output2, model.classifier_configs)
-        return {name: similarity}
+        return similarity
 
     def triplet(self, model, name, classifier, features):
         seq1, mask1 = features[0]
@@ -134,7 +130,7 @@ class _DefaultClassifierStrategy(_ClassifierStrategy):
 
 
 class _ContrastiveLogitStrategy(_ClassifierStrategy):
-    def single(self, model, name, classifier, features):
+    def single(self, name, classifier, features):
         seq, mask = features[0]
         embedding = classifier.encode(seq, mask).to(seq.dtype)
         return {name: embedding}

@@ -143,8 +143,6 @@ class CustomTrainer(Trainer):
         F) 3文サブバッチ全体で相関ペナルティ
         """
         device = next(model.parameters()).device
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
         partitioner = BatchPartitioner(
             attention_mask=inputs["attention_mask"],
             attention_mask_2=inputs.get("attention_mask_2"),
@@ -290,6 +288,20 @@ class CustomTrainer(Trainer):
         return centroids
 
     def _build_train_label_centroids(self) -> Dict[str, Dict[str, Dict[int, np.ndarray]]]:
+        """
+        訓練データセットに対して、各 head / 各ラベルの重心を計算する。
+
+        戻り値の構造:
+            {
+                head_name: {
+                    "classifier": { label_int: np.ndarray (d,) },
+                    "original_avg": { label_int: np.ndarray (d,) },
+                    "original_cls": { label_int: np.ndarray (d,) },
+                    "original_max": { label_int: np.ndarray (d,) },
+                },
+                ...
+            }
+        """
         dataset = self.train_dataset
         if dataset is None:
             return {}
@@ -299,28 +311,31 @@ class CustomTrainer(Trainer):
         was_training = model.training
         model.eval()
 
+        # classifier 出力用: head_name → label → ベクトル和
         head_sums_classifier: Dict[str, Dict[int, np.ndarray]] = defaultdict(dict)
         head_counts_classifier: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
-        head_sums_original: Dict[str, Dict[int, np.ndarray]] = defaultdict(dict)
-        head_counts_original: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+
+        # original 出力用: head_name → pooling_key → label → ベクトル和
+        # pooling_key は "original_avg" / "original_cls" / "original_max"
+        head_sums_original: Dict[str, Dict[str, Dict[int, np.ndarray]]] = defaultdict(
+            lambda: defaultdict(dict)
+        )
+        head_counts_original: Dict[str, Dict[str, Dict[int, int]]] = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(int))
+        )
 
         with torch.no_grad():
             for batch in dataloader:
                 inputs = self._prepare_inputs(batch)
                 _, outputs = self.compute_loss(model, inputs, return_outputs=True)
+
                 labels_tensor = inputs.get("labels")
                 if labels_tensor is None:
                     continue
                 labels_np = labels_tensor.detach().cpu().view(-1).numpy()
                 batch_size = labels_np.shape[0]
 
-                original_embeddings = outputs.get("embeddings")
-                original_np = None
-                if original_embeddings is not None:
-                    original_np = original_embeddings.detach().cpu().numpy()
-                    if original_np.ndim != 2 or original_np.shape[0] == 0:
-                        original_np = None
-
+                # --- classifier 出力を batch 単位で numpy にしておく ---
                 head_arrays: Dict[str, np.ndarray] = {}
                 for head_name, cfg in self.classifier_configs.items():
                     if cfg.get("objective") != "infoNCE":
@@ -333,6 +348,18 @@ class CustomTrainer(Trainer):
                         continue
                     head_arrays[head_name] = arr
 
+                # --- original (pretrained) 出力を pooling ごとに numpy 化 ---
+                original_arrays: Dict[str, np.ndarray] = {}
+                for key in ("original_avg", "original_cls", "original_max"):
+                    tensor = outputs.get(key)
+                    if tensor is None:
+                        continue
+                    arr = tensor.detach().cpu().numpy()
+                    if arr.ndim != 2 or arr.shape[0] == 0:
+                        continue
+                    original_arrays[key] = arr
+
+                # active_heads から「このサンプルはどの head / データセットか」を取得
                 active_heads_field = inputs.get("active_heads", [])
                 head_list = flatten_strings(active_heads_field)
                 if len(head_list) < batch_size:
@@ -340,82 +367,96 @@ class CustomTrainer(Trainer):
                 elif len(head_list) > batch_size:
                     head_list = head_list[:batch_size]
 
+                # --- サンプルごとの集約 ---
                 for idx in range(batch_size):
                     if idx >= len(labels_np):
                         continue
+
                     head_name = head_list[idx] if idx < len(head_list) else None
                     if not head_name:
+                        # どの head にも属さないサンプルはスキップ
                         continue
+
                     cfg = self.classifier_configs.get(head_name)
-                    # infoNCE のみ対応
+                    # infoNCE の head のみ対応
                     if not cfg or cfg.get("objective") != "infoNCE":
                         continue
+
                     label_value = labels_np[idx]
                     if not np.isfinite(label_value):
                         continue
                     label_int = int(label_value)
 
+                    # ---- classifier 出力の重心計算 ----
                     classifier_arr = head_arrays.get(head_name)
-                    vector_classifier = None
                     if classifier_arr is not None and idx < classifier_arr.shape[0]:
                         vector_classifier = classifier_arr[idx]
-                        if not np.isfinite(vector_classifier).all():
-                            vector_classifier = None
+                        if np.isfinite(vector_classifier).all():
+                            sums_for_head = head_sums_classifier[head_name]
+                            if label_int in sums_for_head:
+                                sums_for_head[label_int] += vector_classifier
+                            else:
+                                sums_for_head[label_int] = vector_classifier.copy()
+                            head_counts_classifier[head_name][label_int] += 1
 
-                    vector_original = None
-                    if original_np is not None and idx < original_np.shape[0]:
-                        vector_original = original_np[idx]
-                        if not np.isfinite(vector_original).all():
-                            vector_original = None
+                    # ---- original (pretrained + pooling) 出力の重心計算 ----
+                    # pooling の種類 × head_name × label で重心を持つ
+                    for pool_key, arr in original_arrays.items():
+                        if idx >= arr.shape[0]:
+                            continue
+                        vec = arr[idx]
+                        if not np.isfinite(vec).all():
+                            continue
 
-                    if vector_classifier is not None:
-                        sums_for_head = head_sums_classifier[head_name]
-                        if label_int in sums_for_head:
-                            sums_for_head[label_int] += vector_classifier
+                        sums_for_pool = head_sums_original[head_name][pool_key]
+                        if label_int in sums_for_pool:
+                            sums_for_pool[label_int] += vec
                         else:
-                            sums_for_head[label_int] = vector_classifier.copy()
-                        head_counts_classifier[head_name][label_int] += 1
-
-                    if vector_original is not None:
-                        sums_for_original = head_sums_original[head_name]
-                        if label_int in sums_for_original:
-                            sums_for_original[label_int] += vector_original
-                        else:
-                            sums_for_original[label_int] = vector_original.copy()
-                        head_counts_original[head_name][label_int] += 1
+                            sums_for_pool[label_int] = vec.copy()
+                        head_counts_original[head_name][pool_key][label_int] += 1
 
         if was_training:
             model.train()
 
+        # --- ベクトル和 / カウント から重心に変換 ---
         centroids: Dict[str, Dict[str, Dict[int, np.ndarray]]] = {}
+
+        # classifier か original のどちらかに登場した head をすべて含める
         all_heads = set(head_sums_classifier.keys()) | set(head_sums_original.keys())
         for head_name in all_heads:
-            centroids[head_name] = {}
+            centroids_head: Dict[str, Dict[int, np.ndarray]] = {}
+
+            # classifier 出力の重心
             label_sums_classifier = head_sums_classifier.get(head_name, {})
             if label_sums_classifier:
-                centroids[head_name]["classifier"] = {}
+                centroids_head["classifier"] = {}
                 for label_value, vector_sum in label_sums_classifier.items():
                     count = head_counts_classifier[head_name][label_value]
                     if count <= 0:
                         continue
-                    centroids[head_name]["classifier"][label_value] = (
+                    centroids_head["classifier"][label_value] = (
                         vector_sum / count
                     ).astype(np.float32)
-            label_sums_original = head_sums_original.get(head_name, {})
-            if label_sums_original:
-                centroids[head_name]["original"] = {}
-                for label_value, vector_sum in label_sums_original.items():
-                    count = head_counts_original[head_name][label_value]
+
+            # original 出力 (pooling ごと) の重心
+            label_sums_original_by_pool = head_sums_original.get(head_name, {})
+            for pool_key, label_sums in label_sums_original_by_pool.items():
+                if not label_sums:
+                    continue
+                centroids_head[pool_key] = {}
+                for label_value, vector_sum in label_sums.items():
+                    count = head_counts_original[head_name][pool_key][label_value]
                     if count <= 0:
                         continue
-                    centroids[head_name]["original"][label_value] = (
+                    centroids_head[pool_key][label_value] = (
                         vector_sum / count
                     ).astype(np.float32)
-            if not centroids[head_name]:
-                centroids.pop(head_name)
+
+            if centroids_head:
+                centroids[head_name] = centroids_head
 
         return centroids
-
+    
     def _to_numpy(self, value: Any) -> Optional[np.ndarray]:
         if value is None:
             return None
@@ -463,6 +504,34 @@ class CustomTrainer(Trainer):
                 names.append(None)
         return names
 
+    def _collect_reference_centroids(
+        self,
+        pool_key: str,
+        train_centroids: Optional[Dict[str, Dict[str, Dict[int, np.ndarray]]]],
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[List[Optional[str]]]]:
+        if not train_centroids:
+            return None, None, None
+
+        centroid_embeddings: List[np.ndarray] = []
+        centroid_labels: List[int] = []
+        centroid_heads: List[Optional[str]] = []
+
+        for head_name, entries in train_centroids.items():
+            pool_centroids = entries.get(pool_key)
+            if not pool_centroids:
+                continue
+            for label_value, vector in pool_centroids.items():
+                centroid_embeddings.append(vector)
+                centroid_labels.append(label_value)
+                centroid_heads.append(head_name)
+
+        if not centroid_embeddings:
+            return None, None, None
+
+        emb_array = np.asarray(centroid_embeddings, dtype=np.float32)
+        label_array = np.asarray(centroid_labels, dtype=int)
+        return emb_array, label_array, centroid_heads
+
     @property
     def use_original_eval_embeddings(self) -> bool:
         return self._current_eval_embedding_mode == "original"
@@ -484,6 +553,34 @@ class CustomTrainer(Trainer):
         }
 
         if self.use_original_eval_embeddings:
+            train_centroids = self.get_train_label_centroids()
+            plotted_any = False
+            for pool_key in ("original_avg", "original_cls", "original_max"):
+                embeddings = self._last_eval_predictions.get(pool_key)
+                emb_array = self._to_numpy(embeddings)
+                if emb_array is None or emb_array.ndim != 2 or emb_array.shape[0] < 2:
+                    continue
+
+                labels = self._extract_labels(self._last_eval_label_ids, emb_array.shape[0])
+                head_names = self._extract_active_head_names(self._last_eval_label_ids, emb_array.shape[0])
+                ref_emb, ref_labels, ref_heads = self._collect_reference_centroids(pool_key, train_centroids)
+
+                plot_tsne_embedding_space(
+                    embeddings=emb_array,
+                    labels=labels,
+                    head_name=pool_key,
+                    point_head_names=head_names,
+                    reference_embeddings=ref_emb,
+                    reference_labels=ref_labels,
+                    reference_head_names=ref_heads,
+                    reference_label_suffix=" (train centroid)",
+                    **plotting_kwargs,
+                )
+                plotted_any = True
+
+            if plotted_any:
+                return
+
             embeddings = self._last_eval_predictions.get("embeddings")
             emb_array = self._to_numpy(embeddings)
             if emb_array is None or emb_array.ndim != 2 or emb_array.shape[0] < 2:
@@ -542,4 +639,3 @@ class CustomTrainer(Trainer):
             point_head_names=head_names,
             **plotting_kwargs,
         )
-

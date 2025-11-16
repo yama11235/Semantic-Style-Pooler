@@ -16,7 +16,6 @@ from utils.sentence_batch_utils import BatchPartitioner
 from contextlib import nullcontext
 
 from .classifier_strategies import (
-    _ClassifierStrategy,
     _ContrastiveLogitStrategy,
     _DefaultClassifierStrategy,
 )
@@ -90,18 +89,13 @@ class BiEncoderForClassification(PreTrainedModel):
             ).base_model
             self.backbone.eval()  # 評価モードに設定
             
-        self.pooler = Pooler(model_config.pooler_type)
-        if model_config.pooler_type in {'avg_first_last', 'avg_top2'} or classifier_configs is not None:
-            self.output_hidden_states = True
-        else:
-            self.output_hidden_states = False
-
+        self.output_hidden_states = True
+        self.cls_pooler = Pooler(pooler_type="cls")
+        self.avg_pooler = Pooler(pooler_type="avg")
+        self.max_pooler = Pooler(pooler_type="max")
         self.embedding_classifiers = nn.ModuleDict()
         self.clf_configs = {}
-        self._default_classifier_strategy = _DefaultClassifierStrategy()
-        self._classifier_strategies = {
-            "contrastive_logit": _ContrastiveLogitStrategy(),
-        }
+        self.classifier_strategy = _DefaultClassifierStrategy()
 
         if self.classifier_configs:
             # Build classifiers via factory
@@ -120,51 +114,16 @@ class BiEncoderForClassification(PreTrainedModel):
         }
         # 分類器をbackboneと同じdevice・dtypeに移動
         # print(f"dtype: {next(self.backbone.parameters()).dtype}, device: {next(self.backbone.parameters()).device}")
-        backbone_device = next(self.backbone.parameters()).device
+        self.backbone_device = next(self.backbone.parameters()).device
         for name, classifier in self.embedding_classifiers.items():
-            classifier.to(device=backbone_device)
+            classifier.to(device=self.backbone_device)
             classifier.to(dtype=next(self.backbone.parameters()).dtype)
-
+            
         # --- nGPT-style Block の有無を検出して初期正規化 ------------------
         self.use_ngpt_blocks = self._detect_ngpt_blocks()
         if self.use_ngpt_blocks:
             logger.info("Detected nGPT-style classifier block(s); applying initial weight normalization.")
             self.normalize_ngpt_matrices()
-
-    def _get_classifier_strategy(self, classifier_type: str) -> _ClassifierStrategy:
-        return self._classifier_strategies.get(classifier_type, self._default_classifier_strategy)
-
-    def _build_sentence(self, **kwargs) -> dict:
-        return {name: kwargs.get(name) for name in self._BACKBONE_ARG_NAMES}
-
-    def _infer_batch_size(self, sentence: dict) -> int:
-        for name in self._BACKBONE_ARG_NAMES:
-            tensor = sentence.get(name)
-            if tensor is not None:
-                return tensor.shape[0]
-        raise ValueError("Cannot infer batch size from empty sentence inputs.")
-
-    def _run_backbone(self, sentences: list[dict]) -> tuple:
-        merged = {}
-        for name in self._BACKBONE_ARG_NAMES:
-            tensors = [sentence.get(name) for sentence in sentences]
-            merged[name] = concat_features(*tensors)
-
-        outputs = self.backbone(
-            input_ids=merged["input_ids"],
-            attention_mask=merged["attention_mask"],
-            token_type_ids=merged["token_type_ids"],
-            position_ids=merged["position_ids"],
-            head_mask=merged["head_mask"],
-            inputs_embeds=merged["inputs_embeds"],
-            output_hidden_states=self.output_hidden_states,
-        )
-
-        if torch.isnan(outputs.last_hidden_state).any():
-            raise ValueError("NaN detected in outputs.last_hidden_state")
-
-        batch_sizes = [self._infer_batch_size(sentence) for sentence in sentences]
-        return outputs, merged["attention_mask"], batch_sizes
 
     @staticmethod
     def _split_by_batch(tensor: torch.Tensor, batch_sizes: list[int]) -> list[torch.Tensor]:
@@ -198,64 +157,12 @@ class BiEncoderForClassification(PreTrainedModel):
         hidden = outputs.hidden_states[layer]
         return self._split_by_batch(hidden, batch_sizes)
 
-    def _split_attention_masks(
-        self,
-        attention_mask: torch.Tensor,
-        batch_sizes: list[int],
-    ) -> list[torch.Tensor]:
-        return self._split_by_batch(attention_mask, batch_sizes)
-
-    def _apply_classifiers(
-        self,
-        attention_mask: torch.Tensor,
-        outputs,
-        batch_sizes: list[int],
-        mode: str,
-    ) -> dict:
-        if not self.classifier_configs:
-            return {}
-
-        results = {}
-        mask_splits = self._split_attention_masks(attention_mask, batch_sizes)
-        for name, classifier in self.embedding_classifiers.items():
-            target_layer = int(self.classifier_configs[name]["layer"])
-            sequence_features = self._get_sequence_features(outputs, batch_sizes, target_layer)
-            features = [
-                (seq_feature, mask)
-                for seq_feature, mask in zip(sequence_features, mask_splits)
-            ]
-            strategy = self._get_classifier_strategy(self.classifier_configs[name]["type"])
-            handler = getattr(strategy, mode)
-            results.update(handler(self, name, classifier, features))
-        return results
-
-    def _postprocess_single(self, outputs, attention_mask: torch.Tensor, batch_sizes: list[int]) -> dict:
-        (features,) = self._pool_and_split(attention_mask, outputs, batch_sizes)
-        results = {
-            "original": features,
-            "embeddings": features,
-        }
-        results.update(self._apply_classifiers(attention_mask, outputs, batch_sizes, mode="single"))
-        return results
-
-    def _postprocess_pair(self, outputs, attention_mask: torch.Tensor, batch_sizes: list[int]) -> dict:
-        features1, features2 = self._pool_and_split(attention_mask, outputs, batch_sizes)
-        logits = cosine_similarity(features1, features2, dim=1).to(features1.dtype)
-        results = {"original": logits}
-        results.update(self._apply_classifiers(attention_mask, outputs, batch_sizes, mode="pair"))
-        return results
-
-    def _postprocess_triplet(self, outputs, attention_mask: torch.Tensor, batch_sizes: list[int]) -> dict:
-        features1, features2, features3 = self._pool_and_split(attention_mask, outputs, batch_sizes)
-        logits1 = cosine_similarity(features1, features2, dim=1).to(features1.dtype)
-        logits2 = cosine_similarity(features1, features3, dim=1).to(features1.dtype)
-        results = {
-            "original_pos_similarity": logits1,
-            "original_neg_similarity": logits2,
-        }
-        results.update(self._apply_classifiers(attention_mask, outputs, batch_sizes, mode="triplet"))
-        return results
-
+    def _infer_batch_size(self, sentence: dict) -> int:
+        for name in self._BACKBONE_ARG_NAMES:
+            tensor = sentence.get(name)
+            if tensor is not None:
+                return tensor.shape[0]
+        raise ValueError("Cannot infer batch size from empty sentence inputs.")
 
     def forward(
         self,
@@ -280,7 +187,7 @@ class BiEncoderForClassification(PreTrainedModel):
         inputs_embeds_3=None,
         **kwargs,
     ):
-        device = next(self.backbone.parameters()).device
+        device = self.backbone_device
 
         batch_inputs = {
             "input_ids": input_ids,
@@ -309,24 +216,16 @@ class BiEncoderForClassification(PreTrainedModel):
             attention_mask_3=attention_mask_3,
         )
 
+        # batchデータが全て1種類の入力内容の場合、そのパスだけを実行
         uniform = partitioner.uniform_kind()
         if uniform:
             outputs = self._paths[uniform].run_full(batch_inputs, extra_kwargs)
-            if uniform == "single":
-                embeddings = outputs.get("original")
-                if embeddings is None:
-                    raise ValueError("encode() did not return 'original' embeddings for single-sentence input.")
-                outputs.setdefault("embeddings", embeddings)
-            # print(f"dtype of outputs: { {k: v.dtype for k, v in outputs.items()} }")
             return outputs
 
+        # 複数種類の入力内容が混在する場合、各パスを実行して結果をマージ
         outputs_by_kind = {}
         for kind, path in self._paths.items():
             outputs = path.run_partition(batch_inputs, partitioner, device, extra_kwargs)
-            if kind == "single" and outputs and "embeddings" not in outputs:
-                embeddings = outputs.get("original")
-                if embeddings is not None:
-                    outputs["embeddings"] = embeddings
             outputs_by_kind[kind] = outputs
 
         return partitioner.merge(outputs_by_kind, device=device)
@@ -338,50 +237,44 @@ class BiEncoderForClassification(PreTrainedModel):
         input_ids_2, attention_mask_2, token_type_ids_2, position_ids_2, head_mask_2, inputs_embeds_2,
         **kwargs
     ):
-        sentences = [
-            self._build_sentence(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                head_mask=head_mask,
-                inputs_embeds=inputs_embeds,
-            ),
-            self._build_sentence(
-                input_ids=input_ids_2,
-                attention_mask=attention_mask_2,
-                token_type_ids=token_type_ids_2,
-                position_ids=position_ids_2,
-                head_mask=head_mask_2,
-                inputs_embeds=inputs_embeds_2,
-            ),
-        ]
-        outputs, attention_mask, batch_sizes = self._run_backbone(sentences)
-        return self._postprocess_pair(outputs, attention_mask, batch_sizes)
+        return None  # ダミー --- IGNORE ---
 
     def encode(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            token_type_ids=None,
-            position_ids=None,
-            head_mask=None,
-            inputs_embeds=None,
-            ):
-            """
-            Returns the embedding for single sentence.
-            """
-            sentence = self._build_sentence(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                head_mask=head_mask,
-                inputs_embeds=inputs_embeds,
-            )
-            outputs, attention_mask, batch_sizes = self._run_backbone([sentence])
-            return self._postprocess_single(outputs, attention_mask, batch_sizes)
+        self,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        
+        ):
+        """
+        Returns the embedding for single sentence.
+        """
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_hidden_states=self.output_hidden_states,
+        )
 
+        results = {
+        "original_avg": self.avg_pooler(attention_mask, outputs.last_hidden_state),
+        "original_cls": self.cls_pooler(attention_mask, outputs.last_hidden_state),
+        "original_max": self.max_pooler(attention_mask, outputs.last_hidden_state), 
+    }
+        for name, classifier in self.embedding_classifiers.items():
+            target_layer = int(self.classifier_configs[name]["layer"])
+            sequence_features = self._get_sequence_features(outputs, [input_ids.size(0)], target_layer)[0]
+            features = [(sequence_features, attention_mask)]
+            results[name] = self.classifier_strategy.single(name, classifier, features)
+            
+        return results            
+            
     def classify(
             self,
             input_ids=None,
@@ -394,16 +287,7 @@ class BiEncoderForClassification(PreTrainedModel):
             """
             Returns the embedding for single sentence.
             """
-            sentence = self._build_sentence(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                head_mask=head_mask,
-                inputs_embeds=inputs_embeds,
-            )
-            outputs, attention_mask, batch_sizes = self._run_backbone([sentence])
-            return self._apply_classifiers(attention_mask, outputs, batch_sizes, mode="classify")
+            return None
 
     def triplet_encode(
             self,
@@ -427,36 +311,7 @@ class BiEncoderForClassification(PreTrainedModel):
             inputs_embeds_3=None,
             **kwargs,
             ):
-        if input_ids is None or input_ids_2 is None or input_ids_3 is None:
-            raise ValueError("input_ids, input_ids_2, input_ids_3 must not be None")
-        sentences = [
-            self._build_sentence(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                head_mask=head_mask,
-                inputs_embeds=inputs_embeds,
-            ),
-            self._build_sentence(
-                input_ids=input_ids_2,
-                attention_mask=attention_mask_2,
-                token_type_ids=token_type_ids_2,
-                position_ids=position_ids_2,
-                head_mask=head_mask_2,
-                inputs_embeds=inputs_embeds_2,
-            ),
-            self._build_sentence(
-                input_ids=input_ids_3,
-                attention_mask=attention_mask_3,
-                token_type_ids=token_type_ids_3,
-                position_ids=position_ids_3,
-                head_mask=head_mask_3,
-                inputs_embeds=inputs_embeds_3,
-            ),
-        ]
-        outputs, attention_mask, batch_sizes = self._run_backbone(sentences)
-        return self._postprocess_triplet(outputs, attention_mask, batch_sizes)
+        return None  # ダミー --- IGNORE ---
 
     def save_pretrained(self, model_save_directory, **kwargs):
         os.makedirs(model_save_directory, exist_ok=True)
