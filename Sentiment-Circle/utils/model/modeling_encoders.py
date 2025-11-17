@@ -93,6 +93,7 @@ class BiEncoderForClassification(PreTrainedModel):
         self.cls_pooler = Pooler(pooler_type="cls")
         self.avg_pooler = Pooler(pooler_type="avg")
         self.max_pooler = Pooler(pooler_type="max")
+        self.last_pooler = Pooler(pooler_type="last")
         self.embedding_classifiers = nn.ModuleDict()
         self.clf_configs = {}
         self.classifier_strategy = _DefaultClassifierStrategy()
@@ -263,9 +264,10 @@ class BiEncoderForClassification(PreTrainedModel):
         )
 
         results = {
-        "original_avg": self.avg_pooler(attention_mask, outputs.last_hidden_state),
-        "original_cls": self.cls_pooler(attention_mask, outputs.last_hidden_state),
-        "original_max": self.max_pooler(attention_mask, outputs.last_hidden_state), 
+        "original_avg": self.avg_pooler(attention_mask, outputs),
+        "original_cls": self.cls_pooler(attention_mask, outputs),
+        "original_max": self.max_pooler(attention_mask, outputs), 
+        "original_last": self.last_pooler(attention_mask, outputs),
     }
         for name, classifier in self.embedding_classifiers.items():
             target_layer = int(self.classifier_configs[name]["layer"])

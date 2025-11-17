@@ -162,7 +162,6 @@ class GPTBlockClassifierConfig:
         input_dim: int,
         num_heads: int,
         pooler_type: str,
-        dropout: float = 0.1,
         layer: int = None,
         base_scale: Optional[float] = None,
         bias: bool = False,
@@ -174,7 +173,6 @@ class GPTBlockClassifierConfig:
         self.input_dim = input_dim
         self.num_heads = num_heads
         self.pooler_type = pooler_type
-        self.dropout = dropout
         self.layer = layer
         self.base_scale = base_scale if base_scale is not None else (input_dim ** -0.5)
         self.bias = bias
@@ -186,7 +184,6 @@ class GPTBlockClassifierConfig:
             'input_dim': self.input_dim,
             'num_heads': self.num_heads,
             'pooler_type': self.pooler_type,
-            'dropout': self.dropout,
             'layer': self.layer,
             'base_scale': self.base_scale,
             'bias': self.bias,
@@ -200,7 +197,6 @@ class GPTBlockClassifierConfig:
             input_dim=config_dict['input_dim'],
             num_heads=config_dict['num_heads'],
             pooler_type=config_dict['pooler_type'],
-            dropout=config_dict['dropout'],
             layer=config_dict['layer'],
             base_scale=config_dict.get('base_scale'),
             bias=config_dict.get('bias', False),
@@ -306,8 +302,7 @@ def build_classifiers(classifier_configs: dict, model_config) -> (nn.ModuleDict,
                 input_dim=model_config.hidden_size,
                 num_heads=num_heads,
                 pooler_type=params.get("pooler_type", "cls"),
-                dropout=params.get("dropout", 0.1),
-                layer=params.get("layer", model_config.num_hidden_layers - 1),
+                layer=params.get("layer", -1),
                 base_scale=base_scale,
                 bias=params.get("bias", False),
                 use_ngpt=(ctype_key == 'ngpt'),

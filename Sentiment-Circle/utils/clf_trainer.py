@@ -1,18 +1,18 @@
+"""Custom trainer with multi-head classifier support - refactored version."""
 import os
-
 import numpy as np
 import torch
 from datasets import Dataset
 from transformers import Trainer
-
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from collections import defaultdict
-from utils.sentence_batch_utils import (
+
+from utils.data.batch_utils import (
     BatchPartitioner,
     extract_unique_strings,
     flatten_strings,
 )
-from utils.head_objectives import (
+from utils.training.objectives import (
     AngleNCEObjective,
     BinaryClassificationObjective,
     ContrastiveLogitObjective,
@@ -20,7 +20,6 @@ from utils.head_objectives import (
     InfoNCEObjective,
     RegressionObjective,
 )
-
 from utils.loss_function import (
     compute_pair_correlation_penalty,
     compute_pair_loss,
@@ -29,31 +28,29 @@ from utils.loss_function import (
     compute_triplet_loss,
     fill_missing_output_keys,
 )
-from utils.plot_2D import plot_tsne_embedding_space
+from utils.training.centroid_calculator import CentroidCalculator
+from utils.visualization.tsne_plotter import TSNEVisualizer
+
 
 def pearsonr_torch(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    GPU 上でも安全に動く Pearson 相関係数の実装。
-    要素数チェックと分散ゼロ回避を含みます。
-    """
-    # 要素数チェック
+    """Safe Pearson correlation on GPU."""
     if x.numel() < 2 or y.numel() < 2:
         return x.new_tensor(0.0)
-    # NaN/Inf を除外
     mask = torch.isfinite(x) & torch.isfinite(y)
     x = x[mask]
     y = y[mask]
     if x.numel() < 2:
         return x.new_tensor(0.0)
-    # 標本平均を引く
     xm = x - x.mean()
     ym = y - y.mean()
-    # 分子・分母
     num = (xm * ym).sum()
     den = torch.sqrt((xm * xm).sum() * (ym * ym).sum()).clamp_min(eps)
     return num / den
 
+
 class CustomTrainer(Trainer):
+    """Custom trainer for multi-head classifier training."""
+    
     def __init__(
         self,
         *args,
@@ -65,9 +62,6 @@ class CustomTrainer(Trainer):
         tsne_label_mappings: Optional[Dict[str, Dict[int, str]]] = None,
         **kwargs
     ):
-        """
-        classifier_configs: dict of { head_name: {objective: "infoNCE"/"angleNCE", ...}, ... }
-        """
         super().__init__(*args, **kwargs)
         self.classifier_configs = classifier_configs
         self.dtype = dtype
@@ -79,7 +73,6 @@ class CustomTrainer(Trainer):
         self._train_centroids_dirty: bool = True
         self.tsne_label_mappings: Dict[str, Dict[int, str]] = tsne_label_mappings or {}
 
-        # 損失関数リストを準備
         self.loss_fns = {}
         self.info_nce_params: Dict[str, Dict[str, Any]] = {}
         self.angle_nce_params: Dict[str, Dict[str, Any]] = {}
@@ -99,8 +92,10 @@ class CustomTrainer(Trainer):
                     "pos_pairs": cfg.get("inbatch_positive_pairs", 10),
                     "neg_pairs": cfg.get("inbatch_negative_pairs", 64),
                 }
+        
         self.head2idx = {head: i for i, head in enumerate(classifier_configs.keys())}
         self.idx2head = {idx: head for head, idx in self.head2idx.items()}
+        
         self.head_objectives: Dict[str, HeadObjective] = {}
         for name, cfg in classifier_configs.items():
             obj = cfg.get("objective")
@@ -129,19 +124,18 @@ class CustomTrainer(Trainer):
 
         if self.tsne_save_dir is not None:
             os.makedirs(self.tsne_save_dir, exist_ok=True)
+        
         self._initial_eval_completed = False
         self._current_eval_embedding_mode = "classifier"
+        
+        self.centroid_calculator = CentroidCalculator(
+            classifier_configs, self.head2idx, self.idx2head
+        )
+        self.tsne_visualizer = TSNEVisualizer(
+            tsne_save_dir, classifier_configs, tsne_label_mappings
+        )
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        """
-        フロー：
-        A) バッチを 1文 vs 2文 vs 3文 に分割
-        B) 1文サブバッチは通常の encode() → embeddingから損失ペアを構成して計算
-        C) 2文サブバッチを active_heads ごとに分けて教師損失
-        D) 2文サブバッチ全体で相関ペナルティ
-        E) 3文サブバッチは contrastive_logit
-        F) 3文サブバッチ全体で相関ペナルティ
-        """
         device = next(model.parameters()).device
         partitioner = BatchPartitioner(
             attention_mask=inputs["attention_mask"],
@@ -155,7 +149,6 @@ class CustomTrainer(Trainer):
         inputs3 = partitioner.slice(inputs, "triplet", device)
 
         active_heads = extract_unique_strings(inputs["active_heads"])
-
         total_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
         single_loss, outputs1 = compute_single_loss(self, model, inputs1, active_heads, device)
@@ -179,11 +172,7 @@ class CustomTrainer(Trainer):
             total_loss = total_loss + triplet_corr_penalty
 
         full_outputs = partitioner.merge(
-            {
-                "single": outputs1,
-                "pair": outputs2,
-                "triplet": outputs3,
-            },
+            {"single": outputs1, "pair": outputs2, "triplet": outputs3},
             device=device,
         )
 
@@ -191,33 +180,24 @@ class CustomTrainer(Trainer):
 
         if not return_outputs:
             return total_loss
-
         return total_loss, full_outputs
 
     def training_step(self, model, inputs, num_items_in_batch: Optional[int] = None):
-        # print("Starting training step...")
         output = super().training_step(model, inputs, num_items_in_batch)
         self._train_centroids_dirty = True
         return output
-
 
     def evaluation_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         model.eval()
         with torch.no_grad():
             loss, logits = self.compute_loss(model, inputs, return_outputs=True)
 
-        # print(f"eval loss: {loss}")
-        labels_tensor = inputs["labels"]  # torch.Tensor
-        # 文字列 → 整数に変換
-        ah_list = flatten_strings(inputs["active_heads"])  # 例: ["emotion", "emotion", ...]
-
-        ah_ids = [ self.head2idx[h] for h in ah_list ]
+        labels_tensor = inputs["labels"]
+        ah_list = flatten_strings(inputs["active_heads"])
+        ah_ids = [self.head2idx[h] for h in ah_list]
         ah_tensor = torch.tensor(ah_ids, device=loss.device, dtype=torch.long)
 
-        label_dict = {
-            "labels": labels_tensor,      # torch.Tensor
-            "active_heads": ah_tensor,    # torch.Tensor (整数)
-        }
+        label_dict = {"labels": labels_tensor, "active_heads": ah_tensor}
         return loss, logits, label_dict
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
@@ -229,7 +209,6 @@ class CustomTrainer(Trainer):
         ignore_keys: Optional[List[str]] = None,
         metric_key_prefix: str = "eval",
     ):
-        """オリジナルの evaluate を拡張し、評価前後で T-SNE プロットを生成する。"""
         dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         previous_dataset = self._tsne_current_dataset
         self._tsne_current_dataset = dataset
@@ -248,33 +227,14 @@ class CustomTrainer(Trainer):
             self._current_eval_embedding_mode = "classifier"
             self._tsne_current_dataset = previous_dataset
 
-    def evaluation_loop(
-        self,
-        dataloader,
-        description: str,
-        prediction_loss_only: Optional[bool] = None,
-        ignore_keys: Optional[List[str]] = None,
-        metric_key_prefix: str = "eval",
-    ):
+    def evaluation_loop(self, dataloader, description: str, prediction_loss_only: Optional[bool] = None, ignore_keys: Optional[List[str]] = None, metric_key_prefix: str = "eval"):
         output = super().evaluation_loop(
-            dataloader,
-            description,
-            prediction_loss_only=prediction_loss_only,
-            ignore_keys=ignore_keys,
-            metric_key_prefix=metric_key_prefix,
+            dataloader, description, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix
         )
-
         self._last_eval_predictions = output.predictions
         self._last_eval_label_ids = output.label_ids
-
-        if (
-            self.tsne_save_dir
-            and self._tsne_current_dataset is not None
-            and self._tsne_current_dataset is self.eval_dataset
-            and metric_key_prefix.startswith("eval")
-        ):
+        if (self.tsne_save_dir and self._tsne_current_dataset is not None and self._tsne_current_dataset is self.eval_dataset and metric_key_prefix.startswith("eval")):
             self._save_tsne_plot(metric_key_prefix)
-
         return output
 
     def get_train_label_centroids(self) -> Dict[str, Dict[str, Dict[int, np.ndarray]]]:
@@ -282,181 +242,14 @@ class CustomTrainer(Trainer):
             return {}
         if not self._train_centroids_dirty and self._cached_train_centroids is not None:
             return self._cached_train_centroids
-        centroids = self._build_train_label_centroids()
+        self.centroid_calculator._prepare_inputs = self._prepare_inputs
+        centroids = self.centroid_calculator.build_train_centroids(
+            self.train_dataset, self.model, self.get_eval_dataloader(self.train_dataset), self.compute_loss
+        )
         self._cached_train_centroids = centroids
         self._train_centroids_dirty = False
         return centroids
 
-    def _build_train_label_centroids(self) -> Dict[str, Dict[str, Dict[int, np.ndarray]]]:
-        """
-        訓練データセットに対して、各 head / 各ラベルの重心を計算する。
-
-        戻り値の構造:
-            {
-                head_name: {
-                    "classifier": { label_int: np.ndarray (d,) },
-                    "original_avg": { label_int: np.ndarray (d,) },
-                    "original_cls": { label_int: np.ndarray (d,) },
-                    "original_max": { label_int: np.ndarray (d,) },
-                },
-                ...
-            }
-        """
-        dataset = self.train_dataset
-        if dataset is None:
-            return {}
-
-        dataloader = self.get_eval_dataloader(dataset)
-        model = self.model
-        was_training = model.training
-        model.eval()
-
-        # classifier 出力用: head_name → label → ベクトル和
-        head_sums_classifier: Dict[str, Dict[int, np.ndarray]] = defaultdict(dict)
-        head_counts_classifier: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
-
-        # original 出力用: head_name → pooling_key → label → ベクトル和
-        # pooling_key は "original_avg" / "original_cls" / "original_max"
-        head_sums_original: Dict[str, Dict[str, Dict[int, np.ndarray]]] = defaultdict(
-            lambda: defaultdict(dict)
-        )
-        head_counts_original: Dict[str, Dict[str, Dict[int, int]]] = defaultdict(
-            lambda: defaultdict(lambda: defaultdict(int))
-        )
-
-        with torch.no_grad():
-            for batch in dataloader:
-                inputs = self._prepare_inputs(batch)
-                _, outputs = self.compute_loss(model, inputs, return_outputs=True)
-
-                labels_tensor = inputs.get("labels")
-                if labels_tensor is None:
-                    continue
-                labels_np = labels_tensor.detach().cpu().view(-1).numpy()
-                batch_size = labels_np.shape[0]
-
-                # --- classifier 出力を batch 単位で numpy にしておく ---
-                head_arrays: Dict[str, np.ndarray] = {}
-                for head_name, cfg in self.classifier_configs.items():
-                    if cfg.get("objective") != "infoNCE":
-                        continue
-                    head_tensor = outputs.get(head_name)
-                    if head_tensor is None:
-                        continue
-                    arr = head_tensor.detach().cpu().numpy()
-                    if arr.ndim != 2 or arr.shape[0] == 0:
-                        continue
-                    head_arrays[head_name] = arr
-
-                # --- original (pretrained) 出力を pooling ごとに numpy 化 ---
-                original_arrays: Dict[str, np.ndarray] = {}
-                for key in ("original_avg", "original_cls", "original_max"):
-                    tensor = outputs.get(key)
-                    if tensor is None:
-                        continue
-                    arr = tensor.detach().cpu().numpy()
-                    if arr.ndim != 2 or arr.shape[0] == 0:
-                        continue
-                    original_arrays[key] = arr
-
-                # active_heads から「このサンプルはどの head / データセットか」を取得
-                active_heads_field = inputs.get("active_heads", [])
-                head_list = flatten_strings(active_heads_field)
-                if len(head_list) < batch_size:
-                    head_list = head_list + [""] * (batch_size - len(head_list))
-                elif len(head_list) > batch_size:
-                    head_list = head_list[:batch_size]
-
-                # --- サンプルごとの集約 ---
-                for idx in range(batch_size):
-                    if idx >= len(labels_np):
-                        continue
-
-                    head_name = head_list[idx] if idx < len(head_list) else None
-                    if not head_name:
-                        # どの head にも属さないサンプルはスキップ
-                        continue
-
-                    cfg = self.classifier_configs.get(head_name)
-                    # infoNCE の head のみ対応
-                    if not cfg or cfg.get("objective") != "infoNCE":
-                        continue
-
-                    label_value = labels_np[idx]
-                    if not np.isfinite(label_value):
-                        continue
-                    label_int = int(label_value)
-
-                    # ---- classifier 出力の重心計算 ----
-                    classifier_arr = head_arrays.get(head_name)
-                    if classifier_arr is not None and idx < classifier_arr.shape[0]:
-                        vector_classifier = classifier_arr[idx]
-                        if np.isfinite(vector_classifier).all():
-                            sums_for_head = head_sums_classifier[head_name]
-                            if label_int in sums_for_head:
-                                sums_for_head[label_int] += vector_classifier
-                            else:
-                                sums_for_head[label_int] = vector_classifier.copy()
-                            head_counts_classifier[head_name][label_int] += 1
-
-                    # ---- original (pretrained + pooling) 出力の重心計算 ----
-                    # pooling の種類 × head_name × label で重心を持つ
-                    for pool_key, arr in original_arrays.items():
-                        if idx >= arr.shape[0]:
-                            continue
-                        vec = arr[idx]
-                        if not np.isfinite(vec).all():
-                            continue
-
-                        sums_for_pool = head_sums_original[head_name][pool_key]
-                        if label_int in sums_for_pool:
-                            sums_for_pool[label_int] += vec
-                        else:
-                            sums_for_pool[label_int] = vec.copy()
-                        head_counts_original[head_name][pool_key][label_int] += 1
-
-        if was_training:
-            model.train()
-
-        # --- ベクトル和 / カウント から重心に変換 ---
-        centroids: Dict[str, Dict[str, Dict[int, np.ndarray]]] = {}
-
-        # classifier か original のどちらかに登場した head をすべて含める
-        all_heads = set(head_sums_classifier.keys()) | set(head_sums_original.keys())
-        for head_name in all_heads:
-            centroids_head: Dict[str, Dict[int, np.ndarray]] = {}
-
-            # classifier 出力の重心
-            label_sums_classifier = head_sums_classifier.get(head_name, {})
-            if label_sums_classifier:
-                centroids_head["classifier"] = {}
-                for label_value, vector_sum in label_sums_classifier.items():
-                    count = head_counts_classifier[head_name][label_value]
-                    if count <= 0:
-                        continue
-                    centroids_head["classifier"][label_value] = (
-                        vector_sum / count
-                    ).astype(np.float32)
-
-            # original 出力 (pooling ごと) の重心
-            label_sums_original_by_pool = head_sums_original.get(head_name, {})
-            for pool_key, label_sums in label_sums_original_by_pool.items():
-                if not label_sums:
-                    continue
-                centroids_head[pool_key] = {}
-                for label_value, vector_sum in label_sums.items():
-                    count = head_counts_original[head_name][pool_key][label_value]
-                    if count <= 0:
-                        continue
-                    centroids_head[pool_key][label_value] = (
-                        vector_sum / count
-                    ).astype(np.float32)
-
-            if centroids_head:
-                centroids[head_name] = centroids_head
-
-        return centroids
-    
     def _to_numpy(self, value: Any) -> Optional[np.ndarray]:
         if value is None:
             return None
@@ -468,16 +261,10 @@ class CustomTrainer(Trainer):
             return None
 
     def _extract_labels(self, label_ids: Any, target_len: int) -> np.ndarray:
-        labels = None
-        if isinstance(label_ids, dict):
-            labels = label_ids.get("labels")
-        else:
-            labels = label_ids
-
+        labels = label_ids.get("labels") if isinstance(label_ids, dict) else label_ids
         arr = self._to_numpy(labels)
         if arr is None or arr.size == 0:
             return np.arange(target_len)
-
         flat = arr.reshape(-1)
         if flat.shape[0] < target_len:
             pad = np.full(target_len - flat.shape[0], -1)
@@ -493,7 +280,6 @@ class CustomTrainer(Trainer):
         arr = self._to_numpy(active)
         if arr is None or arr.size == 0:
             return [None] * target_len
-
         flat = arr.reshape(-1)
         names: List[Optional[str]] = []
         for i in range(target_len):
@@ -504,34 +290,6 @@ class CustomTrainer(Trainer):
                 names.append(None)
         return names
 
-    def _collect_reference_centroids(
-        self,
-        pool_key: str,
-        train_centroids: Optional[Dict[str, Dict[str, Dict[int, np.ndarray]]]],
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[List[Optional[str]]]]:
-        if not train_centroids:
-            return None, None, None
-
-        centroid_embeddings: List[np.ndarray] = []
-        centroid_labels: List[int] = []
-        centroid_heads: List[Optional[str]] = []
-
-        for head_name, entries in train_centroids.items():
-            pool_centroids = entries.get(pool_key)
-            if not pool_centroids:
-                continue
-            for label_value, vector in pool_centroids.items():
-                centroid_embeddings.append(vector)
-                centroid_labels.append(label_value)
-                centroid_heads.append(head_name)
-
-        if not centroid_embeddings:
-            return None, None, None
-
-        emb_array = np.asarray(centroid_embeddings, dtype=np.float32)
-        label_array = np.asarray(centroid_labels, dtype=int)
-        return emb_array, label_array, centroid_heads
-
     @property
     def use_original_eval_embeddings(self) -> bool:
         return self._current_eval_embedding_mode == "original"
@@ -539,61 +297,15 @@ class CustomTrainer(Trainer):
     def _save_tsne_plot(self, metric_key_prefix: str) -> None:
         seed = getattr(self.args, "seed", 42) or 42
         global_step = self.state.global_step if self.state is not None else 0
-        plotting_kwargs = {
-            "metric_key_prefix": metric_key_prefix,
-            "save_dir": self.tsne_save_dir,
-            "tsne_label_mappings": self.tsne_label_mappings,
-            "seed": seed,
-            "global_step": global_step,
-        }
-
-        if self.use_original_eval_embeddings:
-            train_centroids = self.get_train_label_centroids()
-            plotted_any = False
-            for pool_key in ("original_avg", "original_cls", "original_max"):
-                embeddings = self._last_eval_predictions.get(pool_key)
-                emb_array = self._to_numpy(embeddings)
-                if emb_array is None or emb_array.ndim != 2 or emb_array.shape[0] < 2:
-                    continue
-
-                labels = self._extract_labels(self._last_eval_label_ids, emb_array.shape[0])
-                head_names = self._extract_active_head_names(self._last_eval_label_ids, emb_array.shape[0])
-                ref_emb, ref_labels, ref_heads = self._collect_reference_centroids(pool_key, train_centroids)
-
-                plot_tsne_embedding_space(
-                    embeddings=emb_array,
-                    labels=labels,
-                    head_name=pool_key,
-                    point_head_names=head_names,
-                    reference_embeddings=ref_emb,
-                    reference_labels=ref_labels,
-                    reference_head_names=ref_heads,
-                    reference_label_suffix=" (train centroid)",
-                    **plotting_kwargs,
-                )
-            return
-
-        for head_name in self.classifier_configs.keys():
-            head_preds = self._last_eval_predictions.get(head_name)
-            emb_array = self._to_numpy(head_preds)
-            if emb_array is None or emb_array.ndim != 2 or emb_array.shape[0] == 0:
-                continue
-
-            labels = self._extract_labels(self._last_eval_label_ids, emb_array.shape[0])
-            active_heads = self._extract_active_head_names(self._last_eval_label_ids, emb_array.shape[0])
-            mask = np.array([h == head_name for h in active_heads], dtype=bool)
-            if not mask.any():
-                continue
-
-            head_embeddings = emb_array[mask]
-            head_labels = labels[mask]
-            if head_embeddings.shape[0] < 2:
-                continue
-
-            plot_tsne_embedding_space(
-                embeddings=head_embeddings,
-                labels=head_labels,
-                head_name=head_name,
-                **plotting_kwargs,
-            )
-        return
+        self.tsne_visualizer.save_tsne_plot(
+            predictions=self._last_eval_predictions,
+            label_ids=self._last_eval_label_ids,
+            metric_key_prefix=metric_key_prefix,
+            embedding_mode=self._current_eval_embedding_mode,
+            seed=seed,
+            global_step=global_step,
+            centroid_getter_fn=self.get_train_label_centroids,
+            to_numpy_fn=self._to_numpy,
+            extract_labels_fn=self._extract_labels,
+            extract_active_heads_fn=self._extract_active_head_names,
+        )

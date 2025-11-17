@@ -10,13 +10,13 @@ if [[ ! -f "${TRAIN_SCRIPT}" ]]; then
 fi
 
 POOLER_OPTIONS=("avg" "max" "cls")
-# POOLER_OPTIONS=("max" "cls")
-FREEZE_ENCODER_OPTIONS=("true" "false")
-# FREEZE_ENCODER_OPTIONS=("true")
-# LEARNING_RATES=("1e-3" "5e-4" "1e-4" "5e-5" "1e-5")
+# FREEZE_ENCODER_OPTIONS=("true" "false")
+FREEZE_ENCODER_OPTIONS=("true")
 LEARNING_RATES=("5e-4" "1e-4" "5e-5")
-TAU_VALUES=("0.25" "0.5" "0.75" "1.0")
-SEED_VALUES=("1" "2" "3" "4" "5")
+TAU_VALUES=("0.25" "0.5" "0.75")
+# CLASSIFIER_TYPES=("GPT" "nGPT")
+CLASSIFIER_TYPES=("GPT")
+SEED_VALUES=("42")
 
 BASE_WANDB_PROJECT=${WANDB_PROJECT:-sentiment_circle_hypra}
 
@@ -34,20 +34,23 @@ for seed in "${SEED_VALUES[@]}"; do
     for freeze in "${FREEZE_ENCODER_OPTIONS[@]}"; do
       for lr in "${LEARNING_RATES[@]}"; do
         for tau in "${TAU_VALUES[@]}"; do
-          lr_token=$(sanitize_token "${lr}")
-          tau_token=$(sanitize_token "${tau}")
-          project_name="pool_${pooler_token}_freeze_${freeze}_lr_${lr_token}_tau_${tau_token}_seed_${seed}"
+          for classifier in "${CLASSIFIER_TYPES[@]}"; do
+            lr_token=$(sanitize_token "${lr}")
+            tau_token=$(sanitize_token "${tau}")
+            project_name="pool_${pooler_token}_freeze_${freeze}_lr_${lr_token}_tau_${tau_token}_clf_${classifier}_seed_${seed}"
 
-          echo "=== Running: POOLER=${pooler}, FREEZE_ENCODER=${freeze}, LR=${lr}, TAU=${tau}, SEED=${seed} ==="
+            echo "=== Running: POOLER=${pooler}, FREEZE_ENCODER=${freeze}, LR=${lr}, TAU=${tau}, CLASSIFIER=${classifier}, SEED=${seed} ==="
 
-          POOLER_TYPE="${pooler}" \
-          FREEZE_ENCODER="${freeze}" \
-          LR="${lr}" \
-          TAU="${tau}" \
-          WANDB_PROJECT="${BASE_WANDB_PROJECT}" \
-          WANDB_PROJECT_NAME="${project_name}" \
-          SEED="${seed}" \
-          bash "${TRAIN_SCRIPT}"
+            POOLER_TYPE="${pooler}" \
+            FREEZE_ENCODER="${freeze}" \
+            LR="${lr}" \
+            TAU="${tau}" \
+            CLASSIFIER_TYPE="${classifier}" \
+            WANDB_PROJECT="${BASE_WANDB_PROJECT}" \
+            WANDB_PROJECT_NAME="${project_name}" \
+            SEED="${seed}" \
+            bash "${TRAIN_SCRIPT}"
+          done
         done
       done
     done

@@ -1,5 +1,5 @@
 #!/bin/bash
-source ../env/.venv/bin/activate
+source ../my-project/.venv/bin/activate
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -21,22 +21,24 @@ POS_PAIRS=${INBATCH_POS_PAIRS:-0}
 NEG_PAIRS=${INBATCH_NEG_PAIRS:-0}
 SEED=${SEED:-42}
 FP16=${FP16:-false}
-BF16=${BF16:-false}
+BF16=${BF16:-true}
 FREEZE_ENCODER=${FREEZE_ENCODER:-true}
-OUTPUT_DIR="${OUTPUT_ROOT}/sentiment_test"
+OUTPUT_DIR="${OUTPUT_ROOT}/hypra_search"
 mkdir -p "${OUTPUT_DIR}"
 
-CONFIG_PATH="${OUTPUT_DIR}/classifier_config.json"
+WANDB_PROJECT_NAME=${WANDB_PROJECT_NAME:-sentiment_info_nce}
+WANDB_PROJECT=${WANDB_PROJECT:-sentiment_circle}
+mkdir -p "${OUTPUT_DIR}/${WANDB_PROJECT}/${WANDB_PROJECT_NAME}"
+
+CONFIG_PATH="${OUTPUT_DIR}/${WANDB_PROJECT}/${WANDB_PROJECT_NAME}/classifier_config.json"
 cat <<JSON >"${CONFIG_PATH}"
 {
   "sentiment": {
-    "type": "linear",
+    "type": "nGPT",
     "layer": -1,
     "objective": "infoNCE",
     "distance": "cosine",
     "pooler_type": "${POOLER_TYPE}",
-    "output_dim": 256,
-    "dropout": 0.1,
     "tau": ${TAU},
     "inbatch_positive_pairs": ${POS_PAIRS},
     "inbatch_negative_pairs": ${NEG_PAIRS}
@@ -44,11 +46,7 @@ cat <<JSON >"${CONFIG_PATH}"
 }
 JSON
 
-WANDB_PROJECT_NAME=${WANDB_PROJECT_NAME:-sentiment_info_nce}
-WANDB_PROJECT=${WANDB_PROJECT:-sentiment_circle}
-mkdir -p "${OUTPUT_DIR}/${WANDB_PROJECT}/${WANDB_PROJECT_NAME}"
-
-CUDA_VISIBLE_DEVICES=0 python "${SCRIPT_DIR}/train.py" \
+CUDA_VISIBLE_DEVICES=1 python "${SCRIPT_DIR}/train.py" \
   --model_name_or_path "${MODEL_NAME}" \
   --output_dir "${OUTPUT_DIR}/${WANDB_PROJECT}/${WANDB_PROJECT_NAME}" \
   --train_file "${DATA_DIR}/Train_df.csv" \
@@ -56,7 +54,6 @@ CUDA_VISIBLE_DEVICES=0 python "${SCRIPT_DIR}/train.py" \
   --test_file "${DATA_DIR}/Test_df.csv" \
   --classifier_configs "${CONFIG_PATH}" \
   --encoding_type bi_encoder \
-  --pooler_type "${POOLER_TYPE}" \
   --max_seq_length ${MAX_SEQ_LEN} \
   --per_device_train_batch_size ${TRAIN_BATCH_SIZE} \
   --per_device_eval_batch_size ${EVAL_BATCH_SIZE} \

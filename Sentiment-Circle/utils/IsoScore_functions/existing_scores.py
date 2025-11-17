@@ -16,7 +16,6 @@ from numpy.random import multivariate_normal
 from scipy.spatial import distance_matrix
 import time 
 from sklearn import datasets
-from skdim.id import *
 
 #################################################################
 #################################################################
@@ -51,7 +50,7 @@ def varex_score(points, p=0.3):
     """Computes how uniform the first p% of princpal components of points are distributed """  
     n = np.shape(points)[0]
     pca_model = PCA(n_components=n)
-    pc_embed = pca_model.fit_transform(points.T))
+    pc_embed = pca_model.fit_transform(points.T)
     var_explained = pca_model.explained_variance_ratio_.cumsum()
     num_components = int(np.floor(n*p))
     uniform_pc = num_components = num_components/n
