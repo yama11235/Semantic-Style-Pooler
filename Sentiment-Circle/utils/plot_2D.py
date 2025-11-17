@@ -174,14 +174,19 @@ def plot_tsne_embedding_space(
         legend_title = "Emotion"
     else:
         legend_title = "Label"
-    ax.legend(loc="best", fontsize="small", title=legend_title)
+    legend = ax.legend(
+    loc="center left",           # 左寄せ
+    bbox_to_anchor=(1.1, 0.5),  # 軸座標(1.2, 0.5) → 右外側中央
+    fontsize="small",
+    title=legend_title,
+    )
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
 
     suffix = head_name if head_name is not None else "original"
     filename = f"{metric_key_prefix}_{suffix}_tsne_step-{global_step:06d}.png"
     save_path = os.path.join(save_dir, filename)
     fig.tight_layout()
-    fig.savefig(save_path, dpi=200)
+    fig.savefig(save_path, dpi=200, bbox_extra_artists=(legend,), bbox_inches="tight")
     plt.close(fig)
 
 

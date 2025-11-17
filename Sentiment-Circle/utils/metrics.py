@@ -291,11 +291,15 @@ def compute_metrics(
                      predictions[f"{head}_neg_similarity"],
                      predictions[f"{head}_anchor_prob"] → shape (N,) or (N, num_classes)
         * predictions["active_heads"] → 長さ N の list/array of str
+        * original 系の埋め込み:
+            - predictions["original_avg"], predictions["original_cls"], predictions["original_max"]
     - eval_pred.label_ids は shape (N,) の numpy array または tensor
     - classifier_configs に従い、サンプルごとに active_head を見てメトリックを計算
     - 最後に全 head ペア間の Pearson 相関を計算
-    - embedding_eval_mode: "classifier" の場合は各 head の埋め込みを使用、
-      "original" の場合はベース埋め込みで InfoNCE 評価を行う
+    - embedding_eval_mode:
+        * "classifier": 各 head の埋め込みで InfoNCE 評価
+        * "original"  : original_avg / cls / max の3種類で InfoNCE 評価し、
+                        メトリクス名に original_avg_ / original_cls_ / original_max_ を付ける
     """
     preds = eval_pred.predictions
     label_dict = eval_pred.label_ids
@@ -309,12 +313,14 @@ def compute_metrics(
     head_vectors: Dict[str, np.ndarray] = {}
     train_centroids = train_centroid_getter() if train_centroid_getter is not None else {}
 
+    # original 系の相関用ベクトル（あれば）
     origin_vector = _build_head_vector(
-        _to_float_array(preds.get("original")),
-        _to_float_array(preds.get("original_pos_similarity")),
-        _to_float_array(preds.get("original_neg_similarity")),
+        _to_float_array(preds.get("original_avg")),
+        _to_float_array(preds.get("original_cls")),
+        _to_float_array(preds.get("original_max")),
     )
-    head_vectors["original"] = origin_vector
+    if origin_vector.size > 0:
+        head_vectors["original"] = origin_vector
 
     for head, cfg in classifier_configs.items():
         objective = cfg.get("objective", "")
@@ -325,32 +331,89 @@ def compute_metrics(
         neg_scores = _to_float_array(preds.get(f"{head}_neg_similarity"))
         anchor_probs = _to_float_array(preds.get(f"{head}_anchor_prob"))
 
-        embeddings = None
-        centroids = None
-        if objective == "infoNCE":
-            embedding_source = preds.get("embeddings") if embedding_eval_mode == "original" else preds.get(head)
-            embeddings = _to_float_array(embedding_source)
-            centroids = _select_centroids((train_centroids or {}).get(head), embedding_eval_mode)
-
-        context = HeadContext(
-            head=head,
-            objective=objective,
-            scores=scores,
-            pos_scores=pos_scores,
-            neg_scores=neg_scores,
-            anchor_probs=anchor_probs,
-            embeddings=embeddings,
-            labels=labels,
-            active_mask=active_mask,
-            centroids=centroids,
-        )
-
         handler = OBJECTIVE_HANDLERS.get(objective)
-        if handler:
-            metrics.update(handler(context))
 
+        # --- InfoNCE: embedding_eval_mode によって挙動を分ける ---
+        if objective == "infoNCE" and handler is not None:
+            head_entry = (train_centroids or {}).get(head)
+
+            if embedding_eval_mode == "classifier":
+                # 従来通り：head の出力埋め込みで評価
+                embedding_source = preds.get(head)
+                embeddings = _to_float_array(embedding_source)
+                centroids = _select_centroids(head_entry, mode="classifier") if head_entry else None
+
+                ctx = HeadContext(
+                    head=head,
+                    objective=objective,
+                    scores=scores,
+                    pos_scores=pos_scores,
+                    neg_scores=neg_scores,
+                    anchor_probs=anchor_probs,
+                    embeddings=embeddings,
+                    labels=labels,
+                    active_mask=active_mask,
+                    centroids=centroids,
+                )
+                metrics.update(handler(ctx))
+
+            elif embedding_eval_mode == "original":
+                # original_avg / cls / max の3種類それぞれで InfoNCE 評価
+                for pool_key in ("original_avg", "original_cls", "original_max"):
+                    embedding_source = preds.get(pool_key)
+                    embeddings = _to_float_array(embedding_source)
+                    if embeddings is None:
+                        continue
+
+                    pool_centroids: Optional[Dict[int, np.ndarray]] = None
+                    if isinstance(head_entry, dict) and pool_key in head_entry:
+                        pool_centroids = head_entry[pool_key]
+                    elif head_entry is not None:
+                        # 互換用のフォールバック（古い形式の場合）
+                        pool_centroids = _select_centroids(head_entry, mode="original")
+
+                    ctx = HeadContext(
+                        head=head,
+                        objective=objective,
+                        scores=scores,
+                        pos_scores=pos_scores,
+                        neg_scores=neg_scores,
+                        anchor_probs=anchor_probs,
+                        embeddings=embeddings,
+                        labels=labels,
+                        active_mask=active_mask,
+                        centroids=pool_centroids,
+                    )
+                    local_metrics = handler(ctx)
+                    # メトリクス名に pooling 種類の prefix を付与
+                    prefixed = {f"{pool_key}_{k}": v for k, v in local_metrics.items()}
+                    metrics.update(prefixed)
+
+            else:
+                # 想定外のモードは何もしない
+                pass
+
+        else:
+            # --- regression / binary_classification / contrastive_logit など ---
+            if handler is not None:
+                ctx = HeadContext(
+                    head=head,
+                    objective=objective,
+                    scores=scores,
+                    pos_scores=pos_scores,
+                    neg_scores=neg_scores,
+                    anchor_probs=anchor_probs,
+                    embeddings=None,   # これらの handler は embeddings を使わない
+                    labels=labels,
+                    active_mask=active_mask,
+                    centroids=None,
+                )
+                metrics.update(handler(ctx))
+
+        # 相関用に head ごとのスコアベクトルを構築（embedding_eval_mode に依存しない）
         head_vectors[head] = _build_head_vector(scores, pos_scores, neg_scores)
 
+    # --- head 間の関係（Pearson / Spearman） ---
     for h1, h2 in combinations(head_vectors.keys(), 2):
         v1 = np.asarray(head_vectors[h1]).flatten()
         v2 = np.asarray(head_vectors[h2]).flatten()
@@ -366,7 +429,5 @@ def compute_metrics(
         metrics[f"{h1}_vs_{h2}_relation-pearson"] = float(pcc)
         metrics[f"{h1}_vs_{h2}_relation-spearman"] = float(scc)
 
-    if embedding_eval_mode == "original":
-        metrics = {f"original_{key}": value for key, value in metrics.items()}
-
+    # 以前あった embedding_eval_mode == "original" の一括 prefix は削除
     return metrics

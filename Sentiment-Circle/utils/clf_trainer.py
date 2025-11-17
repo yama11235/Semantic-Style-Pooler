@@ -537,11 +537,6 @@ class CustomTrainer(Trainer):
         return self._current_eval_embedding_mode == "original"
 
     def _save_tsne_plot(self, metric_key_prefix: str) -> None:
-        if not self.tsne_save_dir:
-            return
-        if not isinstance(self._last_eval_predictions, dict):
-            return
-
         seed = getattr(self.args, "seed", 42) or 42
         global_step = self.state.global_step if self.state is not None else 0
         plotting_kwargs = {
@@ -576,27 +571,8 @@ class CustomTrainer(Trainer):
                     reference_label_suffix=" (train centroid)",
                     **plotting_kwargs,
                 )
-                plotted_any = True
-
-            if plotted_any:
-                return
-
-            embeddings = self._last_eval_predictions.get("embeddings")
-            emb_array = self._to_numpy(embeddings)
-            if emb_array is None or emb_array.ndim != 2 or emb_array.shape[0] < 2:
-                return
-            labels = self._extract_labels(self._last_eval_label_ids, emb_array.shape[0])
-            head_names = self._extract_active_head_names(self._last_eval_label_ids, emb_array.shape[0])
-            plot_tsne_embedding_space(
-                embeddings=emb_array,
-                labels=labels,
-                head_name=None,
-                point_head_names=head_names,
-                **plotting_kwargs,
-            )
             return
 
-        plotted = False
         for head_name in self.classifier_configs.keys():
             head_preds = self._last_eval_predictions.get(head_name)
             emb_array = self._to_numpy(head_preds)
@@ -620,22 +596,4 @@ class CustomTrainer(Trainer):
                 head_name=head_name,
                 **plotting_kwargs,
             )
-            plotted = True
-
-        if plotted:
-            return
-
-        embeddings = self._last_eval_predictions.get("embeddings")
-        emb_array = self._to_numpy(embeddings)
-        if emb_array is None or emb_array.ndim != 2 or emb_array.shape[0] < 2:
-            return
-
-        labels = self._extract_labels(self._last_eval_label_ids, emb_array.shape[0])
-        head_names = self._extract_active_head_names(self._last_eval_label_ids, emb_array.shape[0])
-        plot_tsne_embedding_space(
-            embeddings=emb_array,
-            labels=labels,
-            head_name=None,
-            point_head_names=head_names,
-            **plotting_kwargs,
-        )
+        return

@@ -254,10 +254,6 @@ class ModelArguments:
     freeze_encoder: Optional[bool] = field(
         default=False, metadata={"help": "Freeze encoder weights."}
     )
-    transform: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Use a linear transformation on the encoder output"},
-    )
     classifier_configs: Optional[str] = field(
         default=None,
         metadata={
@@ -270,20 +266,7 @@ class ModelArguments:
     corr_weights: Optional[str] = field(
         default=None,
     )
-    aspect_key: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Aspect key for the dataset. If you don't train a classifier, this is needed to specify the aspect key."
-        },
-    )
-    objective: Optional[str] = field(
-        default="regression",
-        metadata={
-            "help": "Objective for the model. Options:\
-            1) regression: Regression task.\
-            2) binary classification: Classification task."
-        },
-    )
+
     
 def load_raw_datasets(
     model_args: "ModelArguments",
@@ -669,7 +652,6 @@ def main():
             "model_revision": model_args.model_revision,
             "cache_dir": model_args.cache_dir,
             "model_name_or_path": model_args.model_name_or_path,
-            "transform": model_args.transform,
             "attn_implementation": model_args.use_flash_attention,
             "device_map": model_args.device_map,
         }

@@ -31,8 +31,8 @@ class Pooler(nn.Module):
 
         dtype = last_hidden.dtype
 
-        if self.pooler_type in ["cls"]:
-            return last_hidden[:, 0]
+        if self.pooler_type in "cls":
+            return hidden_states[target_layer][:, 0].to(dtype)
         if self.pooler_type == "avg":
             return (
                 (hidden_states[target_layer] * attention_mask.unsqueeze(-1)).sum(1)
